@@ -24,7 +24,7 @@ Repository: https://github.com/ussoewwin/A1111-for-Python3.14
 | Torchaudio | **Not** in the default first-install command (cu132 index has no matching torchaudio; audio paths lazy-import) |
 | Flash-Attention 2 | **2.8.4** aligned to torch 2.13.0+cu132 |
 | CUDA toolkit (Linux FA2 source build) | **13.2** + `nvcc` |
-| NumPy (tracked Windows wheel) | `numpy-1.26.4` **cp314** (replaces cp312 wheel) |
+| NumPy / SciPy | `numpy==2.5.1` and `scipy==1.16.1` from **PyPI** (all platforms) |
 | Requirements files | Renamed to `requirements_versions_py314*.txt` |
 | Critical runtime fix | CPython 3.14 `shared.sd_model` LOAD_ATTR / `None` shadow |
 
@@ -117,12 +117,12 @@ Part of the 3.14 defaults commit (`8588e0ca`):
 
 ---
 
-## 6. Tracked NumPy wheel (Windows)
+## 6. NumPy / SciPy (`numpy==2.5.1`)
 
-- Removed tracked `whl/numpy-1.26.4-cp312-cp312-win_amd64.whl`.
-- Added tracked `whl/numpy-1.26.4-cp314-cp314-win_amd64.whl`.
-
-Commit: `15d8a90b`
+- Startup installs **`numpy==2.5.1`** from PyPI on **all platforms** (`modules/launch_utils.py`), then pins again after extension installers so drift cannot stick.
+- Requirements: `requirements_versions_py314.txt` / `requirements_versions_py314_windows.txt` pin `numpy==2.5.1`.
+- **SciPy** is `scipy==1.16.1` from PyPI, aligned to that NumPy pin (no Windows-only HF scipy wheel forced onto Linux).
+- Interim tracked `whl/numpy-1.26.4-cp314-…` work (commit `15d8a90b`) is **not** the v3.0.0 install path; runtime does **not** install NumPy from that local wheel.
 
 ---
 
@@ -165,10 +165,11 @@ Earlier v2.3.x work (RES4LYF, Forge tiled VAE, ControlNet bf16, LoRA logging, et
 
 1. Fresh **Python 3.14** venv; confirm startup does not reject the interpreter.
 2. Confirm installed torch prints `2.13.0+cu132` (or your override) and matching torchvision.
-3. Windows: FA2 wheel installs; Linux: FA2 source build completes with toolkit 13.2.
-4. Load SD1.5 / SDXL, run txt2img with ControlNet and/or MultiDiffusion if you use them — confirm no intermittent `sd_model is None`.
-5. Switch checkpoints / VAE mid-session without LoRA / VAE `NoneType` crashes.
-6. Optional: RES4LYF hybrid `*4h4s` still completes (shim from prior releases).
+3. Confirm `numpy==2.5.1` (and `scipy==1.16.1`) from PyPI — not a local `whl/numpy-1.26.4` install.
+4. Windows: FA2 wheel installs; Linux: FA2 source build completes with toolkit 13.2.
+5. Load SD1.5 / SDXL, run txt2img with ControlNet and/or MultiDiffusion if you use them — confirm no intermittent `sd_model is None`.
+6. Switch checkpoints / VAE mid-session without LoRA / VAE `NoneType` crashes.
+7. Optional: RES4LYF hybrid `*4h4s` still completes (shim from prior releases).
 
 ---
 
