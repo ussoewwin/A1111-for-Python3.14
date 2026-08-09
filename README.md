@@ -86,7 +86,7 @@ The following packages are installed automatically during initial setup (see `mo
 - **transformers**: 5.4.0
 - **protobuf**: 7.34.1
 - **scipy**: 1.16.1 (PyPI, all platforms)
-- **numpy**: 2.5.1 (PyPI, all platforms)
+- **numpy**: 2.4.6 (PyPI, all platforms; numba / facexlib compatible)
 - **Gradio**: 3.41.2 (HF wheel with METADATA pins removed)
 
 ## Installation
@@ -128,10 +128,11 @@ Pick the section for your OS and follow the steps in order.
    pip install triton-windows
    ```
 
-7. Install ONNX Runtime GPU (Windows CUDA 13 nightly feed):
+7. ONNX Runtime GPU is installed automatically on first launch (`modules/launch_utils.py`) from the Windows CUDA 13 nightly feed:
    ```cmd
    pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
    ```
+   Manual install of the same command is only needed if you used `--skip-install`.
 
 8. Install Insightface:
    ```cmd
@@ -183,10 +184,11 @@ Pick the section for your OS and follow the steps in order.
    pip install triton
    ```
 
-7. Install ONNX Runtime GPU:
+7. ONNX Runtime GPU is installed automatically on first launch (`modules/launch_utils.py`):
    ```bash
    pip install onnxruntime-gpu
    ```
+   Manual install is only needed if you used `--skip-install`.
 
 8. Install Insightface:
    ```bash
@@ -254,7 +256,8 @@ Pick the section for your OS and follow the steps in order.
 - **PyTorch default** (Windows / Linux CUDA): `torch==2.13.0+cu132` + `torchvision==0.28.0+cu132` via `TORCH_COMMAND` / `TORCH_INDEX_URL` (`https://download.pytorch.org/whl/cu132`). Same pin on first install for both platforms so Linux FA2 builds against the Windows FA2 stack.
 - **Requirements file**: Windows → `requirements_versions_py314_windows.txt`; Linux / macOS → `requirements_versions_py314.txt`.
 - **Flash-Attention 2**: Windows HF prebuilt `flash_attn-2.8.4+cu132torch2.13.0` cp314 / Linux PyPI `flash-attn==2.8.4` with `--no-build-isolation` (needs CUDA toolkit 13.2 + `nvcc`) / macOS skip.
-- **NumPy / SciPy**: all platforms install `numpy==2.5.1` and `scipy==1.16.1` from PyPI (no Windows-only wheel forced onto Linux).
+- **NumPy / SciPy**: all platforms install `numpy==2.4.6` and `scipy==1.16.1` from PyPI (no Windows-only wheel forced onto Linux). NumPy is pinned to 2.4.6 so numba/facexlib work on first install.
+- **ONNX Runtime**: Windows first launch installs `onnxruntime-gpu` from `ort-cuda-13-nightly` (InsightFace / ReActor / ADetailer). Linux uses PyPI `onnxruntime-gpu`; macOS uses `onnxruntime`.
 - **`clip.py` `pkg_resources` auto-fix**: `venv/Lib/...` on Windows; `venv/lib/pythonX.Y/...` on Linux / macOS (major / minor from the running interpreter).
 - **Python gate**: `check_python_version()` allows **3.14 only** (`webui.sh` default `python_cmd` is `python3.14`).
 

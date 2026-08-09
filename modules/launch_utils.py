@@ -730,11 +730,11 @@ def prepare_environment():
 
     run_pip("install --upgrade packaging", "packaging")
 
-    # Pin numpy==2.5.1 before -r (same premise as Stable-Diffusion-WebUI-Forge-Nunchaku).
+    # Pin numpy==2.4.6 before -r (numba / facexlib compatible; not 2.5.x).
     # Install early so already-imported modules do not keep a stale numpy.
     run(f'"{python}" -m pip uninstall numpy -y', "uninstalling numpy", "Couldn't uninstall numpy", live=False)
-    run(f'"{python}" -m pip install --no-cache-dir numpy==2.5.1', "Installing numpy 2.5.1", "Couldn't install numpy 2.5.1", live=False)
-    print("[INFO] Installed numpy==2.5.1 from PyPI")
+    run(f'"{python}" -m pip install --no-cache-dir numpy==2.4.6', "Installing numpy 2.4.6", "Couldn't install numpy 2.4.6", live=False)
+    print("[INFO] Installed numpy==2.4.6 from PyPI")
 
     # Gradio from HF (METADATA version pins removed)
     run_pip(f'install "{gradio_package}"', "gradio")
@@ -746,10 +746,31 @@ def prepare_environment():
         run_pip(f"install -U --upgrade-strategy only-if-needed -r \"{requirements_file}\"", "requirements")
         startup_timer.record("install requirements")
     
-    # scipy via PyPI to match numpy 2.5.1
+    # scipy via PyPI to match numpy 2.4.6
     run(f'"{python}" -m pip uninstall scipy -y', "uninstalling scipy", "Couldn't uninstall scipy", live=False)
     run(f'"{python}" -m pip install --no-cache-dir scipy==1.16.1', "Installing scipy 1.16.1", "Couldn't install scipy 1.16.1", live=False)
     print("[INFO] Installed scipy 1.16.1 from PyPI")
+
+    # ONNX Runtime before extension installers (InsightFace / ReActor / ADetailer / WD14).
+    # Windows CUDA 13: ort-cuda-13-nightly onnxruntime-gpu (README). Dist name may be
+    # onnxruntime-gpu while import remains onnxruntime — check import, not dist name.
+    if not check_run_python("import onnxruntime"):
+        if platform.system() == "Windows":
+            ort_index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/"
+            run(
+                f'"{python}" -m pip install --pre --index-url {ort_index} onnxruntime-gpu',
+                "Installing onnxruntime-gpu (CUDA 13 nightly)",
+                "Couldn't install onnxruntime-gpu",
+                live=True,
+            )
+            print("[INFO] Installed onnxruntime-gpu from ort-cuda-13-nightly")
+        elif platform.system() == "Darwin":
+            run_pip("install onnxruntime", "onnxruntime")
+            print("[INFO] Installed onnxruntime (macOS)")
+        else:
+            run_pip("install onnxruntime-gpu", "onnxruntime-gpu")
+            print("[INFO] Installed onnxruntime-gpu")
+        startup_timer.record("install onnxruntime")
     
     # Auto-fix clip.py packaging import (AFTER requirements installation)
     def fix_clip_packaging_import():
@@ -794,9 +815,9 @@ def prepare_environment():
 
     if not args.skip_install:
         run_extensions_installers(settings_file=args.ui_settings_file)
-        # Keep Forge-aligned pin if an extension installer drifted numpy.
-        run(f'"{python}" -m pip install --force-reinstall --no-deps --no-cache-dir numpy==2.5.1', "re-pin: numpy 2.5.1", "Couldn't install numpy 2.5.1", live=False)
-        print("[INFO] Re-pinned numpy==2.5.1 after extensions")
+        # Keep pin if an extension installer drifted numpy.
+        run(f'"{python}" -m pip install --force-reinstall --no-deps --no-cache-dir numpy==2.4.6', "re-pin: numpy 2.4.6", "Couldn't install numpy 2.4.6", live=False)
+        print("[INFO] Re-pinned numpy==2.4.6 after extensions")
 
     if args.update_check:
         version_check(commit)

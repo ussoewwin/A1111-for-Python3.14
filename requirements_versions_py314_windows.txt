@@ -7,7 +7,7 @@ blendmodes==2025
 clean-fid==0.1.35
 diskcache==5.6.3
 einops>=0.4.1
-# facexlib==0.3.0  # omitted: numba rejects numpy>=2.5 at import; GFPGAN/CodeFormer face helper unavailable until numba supports 2.5
+facexlib==0.3.0
 fastapi==0.94.0
 gradio==3.41.2
 altair>=6.0.0
@@ -17,7 +17,7 @@ inflection==0.5.1
 jsonmerge==1.8.0
 kornia==0.6.7
 lark==1.1.2
-numpy==2.5.1
+numpy==2.4.6
 omegaconf==2.2.3
 open-clip-torch==3.1.0
 piexif==1.1.3

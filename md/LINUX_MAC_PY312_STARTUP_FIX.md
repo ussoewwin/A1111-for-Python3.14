@@ -1,6 +1,6 @@
 # Linux / Mac Python 3.12 Startup Failure Fix
 
-> **Current fork target (supersedes this document's Python 3.12 wording):** Python **3.14** only. Runtime pins and OS branching live in `modules/launch_utils.py` and the root `README.md`. Today: FA2 Windows HF `2.8.4` cp314 / Linux `flash-attn==2.8.4`; **`numpy==2.5.1` and `scipy==1.16.1` from PyPI on all platforms** (not `numpy==1.26.4`, not a local `whl/numpy-1.26.4` install, not a Windows-only SciPy HF wheel). `webui.sh` default `python_cmd=python3.14`. Sections below that mention `numpy==1.26.4` / HF SciPy are the **historical design record** of the original Linux/Mac branching work — not the live install path.
+> **Current fork target (supersedes this document's Python 3.12 wording):** Python **3.14** only. Runtime pins and OS branching live in `modules/launch_utils.py` and the root `README.md`. Today: FA2 Windows HF `2.8.4` cp314 / Linux `flash-attn==2.8.4`; **`numpy==2.4.6` and `scipy==1.16.1` from PyPI on all platforms** (not `numpy==1.26.4`, not a local `whl/numpy-1.26.4` install, not a Windows-only SciPy HF wheel). `webui.sh` default `python_cmd=python3.14`. Sections below that mention `numpy==1.26.4` / HF SciPy are the **historical design record** of the original Linux/Mac branching work — not the live install path.
 
 ## 1. The Original Problem
 
@@ -121,7 +121,7 @@ else:
 
 - **(Historical)** Windows forced the HF prebuilt wheel via `--no-index` while the repo still pinned `numpy==1.26.4`; that SciPy wheel matched that NumPy dtype layout.
 - **(Historical)** Linux / Mac already pulled `scipy==1.16.1` from PyPI via platform tags.
-- **Current (v3.0.0 / Python 3.14):** all platforms install `numpy==2.5.1` then `scipy==1.16.1` from PyPI (`modules/launch_utils.py`). No HF SciPy URL and no local NumPy 1.26.4 wheel on the install path.
+- **Current (v3.0.0 / Python 3.14):** all platforms install `numpy==2.4.6` then `scipy==1.16.1` from PyPI (`modules/launch_utils.py`). No HF SciPy URL and no local NumPy 1.26.4 wheel on the install path.
 
 ### 5-4. `clip_py_path` — Platform Branching (`modules/launch_utils.py`)
 
@@ -161,7 +161,7 @@ The following were verified to ensure the **Windows path is exactly equivalent t
 - FA2 source build requires a **CUDA toolkit + nvcc + gcc**.
 - Build time is roughly 30 minutes on typical hardware; longer for exotic CUDA architectures.
 - The build can peak above 16 GB of memory; ensure swap / RAM is adequate.
-- **Current** runtime stack: `numpy==2.5.1` / `scipy==1.16.1` / default torch `2.13.0+cu132` (see README). The older assumption (`numpy==1.26.4` / torch 2.10.0 + cu130) is historical only.
+- **Current** runtime stack: `numpy==2.4.6` / `scipy==1.16.1` / default torch `2.13.0+cu132` (see README). The older assumption (`numpy==1.26.4` / torch 2.10.0 + cu130) is historical only.
 
 ### 7-2. Mac
 

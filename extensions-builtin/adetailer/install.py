@@ -35,9 +35,16 @@ def is_installed(
 
     try:
         pkg_version = version(package)
-        return parse(min_version) <= parse(pkg_version) <= parse(max_version)
     except Exception:
-        return False
+        # onnxruntime-gpu provides import name "onnxruntime" but a different dist name.
+        if package == "onnxruntime":
+            try:
+                pkg_version = version("onnxruntime-gpu")
+            except Exception:
+                return True
+        else:
+            return False
+    return parse(min_version) <= parse(pkg_version) <= parse(max_version)
 
 
 def run_pip(*args):
@@ -162,6 +169,16 @@ def download_insightface():
     print("[-] ADetailer: InsightFace installation completed")
 
 
+def onnxruntime_available(min_version: str = "1.16.0") -> bool:
+    """True if `import onnxruntime` works (covers onnxruntime-gpu dist name)."""
+    try:
+        import onnxruntime as ort
+
+        return parse(ort.__version__) >= parse(min_version)
+    except Exception:
+        return False
+
+
 def install():
     deps = [
         # requirements
@@ -169,8 +186,7 @@ def install():
         ("rich", "13.0.0", None),
         ("huggingface_hub", None, None),
         ("requests", None, None),  # for YOLOv11 model download
-        # InsightFace dependencies
-        ("onnxruntime", "1.16.0", None),  # Required by InsightFace
+        # InsightFace dependencies (ORT itself is installed by launch_utils on first run)
         ("ml_dtypes", "0.4.0", None),  # Fix for InsightFace compatibility
         ("onnx", "1.15.0", None),  # ONNX for InsightFace
     ]
@@ -190,6 +206,13 @@ def install():
 
     if pkgs:
         run_pip(*pkgs)
+
+    if not onnxruntime_available():
+        print(
+            "[!] ADetailer: onnxruntime import failed; "
+            "first-install should provide onnxruntime-gpu via launch_utils "
+            "(Windows: ort-cuda-13-nightly)."
+        )
     
     # Download YOLOv8 models after installing dependencies
     download_models()

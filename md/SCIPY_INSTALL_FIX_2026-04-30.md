@@ -1,6 +1,6 @@
 # SciPy Install Fix (2026-04-30): Complete Technical Explanation
 
-> **Current stack (supersedes the NumPy pin named in the historical code below):** startup installs **`numpy==2.5.1`** and **`scipy==1.16.1` from PyPI** on all platforms (`modules/launch_utils.py`). Comments and prose that say `numpy==1.26.4` below describe the **2026-04-30** commit state, not today's pin.
+> **Current stack (supersedes the NumPy pin named in the historical code below):** startup installs **`numpy==2.4.6`** and **`scipy==1.16.1` from PyPI** on all platforms (`modules/launch_utils.py`). Comments and prose that say `numpy==1.26.4` below describe the **2026-04-30** commit state, not today's pin.
 
 ## Summary
 
@@ -9,7 +9,7 @@ This document explains, in full detail, the SciPy installation issue that caused
 - Commit: `18d4a4e`
 - Scope: SciPy install logic in startup path
 - Result: Unified SciPy install flow across Windows/Linux/macOS via PyPI
-- Later (v3.0.0 / Python 3.14): NumPy pin moved to **`numpy==2.5.1`**; SciPy remains PyPI `1.16.1`
+- Later (v3.0.0 / Python 3.14): NumPy pin moved to **`numpy==2.4.6`** (numba / facexlib); SciPy remains PyPI `1.16.1`
 
 ---
 
@@ -87,7 +87,7 @@ print("[INFO] Installed scipy 1.16.1 from PyPI")
 
 - Explicit uninstall before reinstall (`pip uninstall scipy -y`)
 - Explicit SciPy pin (`scipy==1.16.1`)
-- Compatibility intent comment for the then-current `numpy==1.26.4` dtype layout (later superseded by `numpy==2.5.1`)
+- Compatibility intent comment for the then-current `numpy==1.26.4` dtype layout (later superseded by `numpy==2.4.6`)
 
 ---
 
@@ -119,7 +119,7 @@ At commit `18d4a4e` the fix preserved that era's compatibility target:
 - SciPy remained pinned to `1.16.1`
 - The comment still named alignment with then-current `numpy==1.26.4` startup assumptions
 
-**Current:** SciPy is still `1.16.1` from PyPI; NumPy is **`numpy==2.5.1`** from PyPI (all platforms). Do not treat `1.26.4` as the live pin.
+**Current:** SciPy is still `1.16.1` from PyPI; NumPy is **`numpy==2.4.6`** from PyPI (all platforms). Do not treat `1.26.4` as the live pin.
 
 ---
 
