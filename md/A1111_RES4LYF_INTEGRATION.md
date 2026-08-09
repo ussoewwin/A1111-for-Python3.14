@@ -47,7 +47,7 @@
 
 ### 1.4 Manual environment change (outside integration code)
 
-In `requirements_versions_py312.txt` / `requirements_versions_py312_windows.txt`,  
+In `requirements_versions_py314.txt` / `requirements_versions_py314_windows.txt`,  
 relaxed `einops==0.4.1` to **`einops>=0.4.1`** (ComfyUI / spandrel need `from einops import einsum`).
 
 ---

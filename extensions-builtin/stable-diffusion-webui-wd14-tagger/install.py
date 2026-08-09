@@ -54,8 +54,8 @@ def install():
         return
 
     deps = [
-        # requirements (only packages NOT already in main requirements)
-        ("deepdanbooru", None, None),
+        # Non-TF deps only. deepdanbooru + tensorflow install on demand when a
+        # DeepDanbooru model is loaded (see tagger/interrogator.py).
         ("jsonschema", None, None),
         ("opencv-contrib-python", None, None),
     ]

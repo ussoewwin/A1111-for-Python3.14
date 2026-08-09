@@ -249,8 +249,9 @@ class DeepDanbooruInterrogator(Interrogator):
     def load(self) -> None:
         print(f'Loading {self.name} from {str(self.project_path)}')
 
-        # deepdanbooru package is not include in web-sd anymore
-        # https://github.com/AUTOMATIC1111/stable-diffusion-webui/commit/c81d440d876dfd2ab3560410f37442ef56fc663
+        # deepdanbooru / tensorflow are optional: ONNX WaifuDiffusion models need
+        # neither. Install only when a DeepDanbooru (TF) model is actually loaded.
+        # Do not pin tensorflow — pinned 2.10 / 2.20 break current Python/Windows.
         from launch import is_installed, run_pip
         if not is_installed('deepdanbooru'):
             package = os.environ.get(
@@ -258,11 +259,23 @@ class DeepDanbooruInterrogator(Interrogator):
                 'git+https://github.com/KichangKim/DeepDanbooru.'
                 'git@d91a2963bf87c6a770d74894667e9ffa9f6de7ff'
             )
+            run_pip(f'install {package}', 'deepdanbooru')
 
-            run_pip(
-                f'install {package} tensorflow tensorflow-io', 'deepdanbooru')
+        if not is_installed('tensorflow'):
+            tf_pkg = os.environ.get(
+                'WD14_TENSORFLOW_PACKAGE',
+                'tensorflow tensorflow-io',
+            )
+            run_pip(f'install {tf_pkg}', 'tensorflow')
 
-        import tensorflow as tf
+        try:
+            import tensorflow as tf
+        except ImportError as err:
+            raise RuntimeError(
+                f'{self.name} needs TensorFlow, but import failed ({err}). '
+                'Use an ONNX WD14 model instead, or install a TensorFlow build '
+                'compatible with this Python (WD14_TENSORFLOW_PACKAGE).'
+            ) from err
 
         # tensorflow maps nearly all vram by default, so we limit this
         # https://www.tensorflow.org/guide/gpu#limiting_gpu_memory_growth

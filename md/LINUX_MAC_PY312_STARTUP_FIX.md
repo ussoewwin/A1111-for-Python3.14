@@ -8,7 +8,7 @@ In reality, launching `webui.sh` on Linux / Mac with Python 3.12 would **fail du
 
 | Symptom | Location | Result |
 |---|---|---|
-| `FileNotFoundError: requirements_versions_py312.txt` | `modules/launch_utils.py` — referenced in the non-Windows Py3.12 branch | Exception before any dependency install |
+| `FileNotFoundError: requirements_versions_py314.txt` | `modules/launch_utils.py` — referenced in the non-Windows Py3.12 branch | Exception before any dependency install |
 | `pip install <Windows wheel URL>` rejected on other platforms | FA2 install (`flash_attn-2.8.3+cu130torch2.10.0cxx11abiTRUE-cp312-cp312-win_amd64.whl`) | Linux/Mac pip rejects `win_amd64` platform tag, install fails |
 | `pip install <Windows wheel URL> --no-deps --no-index` unavoidable | scipy install (`scipy-1.16.1-cp312-cp312-win_amd64.whl`) | `--no-index` forces direct URL download, always fails on non-Windows |
 | `clip.py` auto-fix never triggers | `fix_clip_packaging_import()` hardcodes the Windows venv layout (`venv\Lib\site-packages\clip\clip.py`) | Linux/Mac venv is `venv/lib/python3.12/site-packages/...`; the `os.path.isfile(...)` check is False, so the fix silently skips |
@@ -29,7 +29,7 @@ A plain `pip install <Windows wheel URL>` could have let pip detect the platform
 
 ### 2-4. Missing Requirements File
 
-`launch_utils.py` referenced `requirements_versions_py312.txt` for non-Windows Py3.12, but **the file did not exist in the repository**.
+`launch_utils.py` referenced `requirements_versions_py314.txt` for non-Windows Py3.12, but **the file did not exist in the repository**.
 
 ## 3. Fix Strategy
 
@@ -45,15 +45,15 @@ Overall approach:
 | A | FA2 install | HF prebuilt `torch2.10.0 cu130 win_amd64` wheel (unchanged) | `pip install flash-attn==2.8.3 --no-build-isolation` (PyPI source build, ~30 min, requires CUDA toolkit + nvcc + gcc) | skipped (`fa2_install_enabled=False`) — FA2 is CUDA-only, MPS backend cannot use it |
 | B | scipy install | HF prebuilt `cp312 win_amd64` wheel (`--no-index`, preserved to match numpy 1.26.4 dtype layout) | PyPI `scipy==1.16.1` (pip auto-selects the appropriate manylinux wheel via platform tag) | PyPI `scipy==1.16.1` (macosx wheel, same mechanism) |
 | C | `clip_py_path` | `venv\Lib\site-packages\clip\clip.py` (unchanged) | `venv/lib/python{M}.{N}/site-packages/clip/clip.py` | same as Linux |
-| D | requirements file | `requirements_versions_py312_windows.txt` (existing) | `requirements_versions_py312.txt` (newly created by this fix) | same as Linux |
+| D | requirements file | `requirements_versions_py314_windows.txt` (existing) | `requirements_versions_py314.txt` (newly created by this fix) | same as Linux |
 
 ## 4. Modified Files
 
 | File | Change | Commit |
 |---|---|---|
 | `modules/launch_utils.py` | FA2 platform branch (L360-372) / scipy platform branch (L526-540) / `clip_py_path` platform branch (L534-540) | `0346830` (FA2) + `12eeee0` (scipy + clip) |
-| `requirements_versions_py312_windows.txt` | Bumped to `transformers==5.4.0` / `protobuf==7.34.1` (precondition for this fix) | `0346830` |
-| `requirements_versions_py312.txt` (new) | Requirements for Linux / Mac Py3.12. Byte-identical to the Windows version (platform-specific packages are handled by the platform branching in `launch_utils.py`, so a shared file is sufficient) | `0346830` |
+| `requirements_versions_py314_windows.txt` | Bumped to `transformers==5.4.0` / `protobuf==7.34.1` (precondition for this fix) | `0346830` |
+| `requirements_versions_py314.txt` (new) | Requirements for Linux / Mac Py3.12. Byte-identical to the Windows version (platform-specific packages are handled by the platform branching in `launch_utils.py`, so a shared file is sufficient) | `0346830` |
 
 ## 5. Code and What It Means
 

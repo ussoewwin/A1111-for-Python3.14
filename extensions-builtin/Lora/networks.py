@@ -491,10 +491,15 @@ def convert_diffusers_name_to_compvis(key, is_sd2):
 
 
 def assign_network_names_to_compvis_modules(sd_model):
+    # Use the callback argument, not shared.sd_model: during weight reload /
+    # VAE reload shared.sd_model can still be None while the passed model is valid.
+    if sd_model is None:
+        return
+
     network_layer_mapping = {}
 
-    if shared.sd_model.is_sdxl:
-        for i, embedder in enumerate(shared.sd_model.conditioner.embedders):
+    if sd_model.is_sdxl:
+        for i, embedder in enumerate(sd_model.conditioner.embedders):
             if not hasattr(embedder, 'wrapped'):
                 continue
 
@@ -506,14 +511,14 @@ def assign_network_names_to_compvis_modules(sd_model):
         _add_sdxl_clip_transformer_aliases(network_layer_mapping)
         _add_openclip_attention_virtual_keys(network_layer_mapping)
     else:
-        cond_stage_model = getattr(shared.sd_model.cond_stage_model, 'wrapped', shared.sd_model.cond_stage_model)
+        cond_stage_model = getattr(sd_model.cond_stage_model, 'wrapped', sd_model.cond_stage_model)
 
         for name, module in cond_stage_model.named_modules():
             network_name = name.replace(".", "_")
             network_layer_mapping[network_name] = module
             module.network_layer_name = network_name
 
-    for name, module in shared.sd_model.model.named_modules():
+    for name, module in sd_model.model.named_modules():
         network_name = name.replace(".", "_")
         network_layer_mapping[network_name] = module
         module.network_layer_name = network_name

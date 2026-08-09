@@ -43,15 +43,18 @@ def hf_download(file: str, repo_id: str = REPO_ID, check_remote: bool = True) ->
     if file == "face_yolov8n.pt":
         return "INVALID"
     
-    # Check local paths first
+    # Check local paths first (builtin + legacy + cwd-relative)
+    _builtin_models = Path(__file__).resolve().parents[1] / "models"
     possible_paths = [
+        _builtin_models / file,
+        Path("extensions-builtin/adetailer/models") / file,
         Path("extensions/adetailer/models") / file,
         Path("models/adetailer") / file,
     ]
-    
+
     for local_path in possible_paths:
         if local_path.exists():
-            return str(local_path)
+            return str(local_path.resolve())
     
     if check_remote:
         with suppress(Exception):
@@ -127,9 +130,15 @@ def get_models(
         "person_yolov8s-seg.pt",
         "yolov8x-worldv2.pt",
     ]
-    
-    # Using YOLO models only for simplicity and reliability
-    models.update(download_models(*to_download, check_remote=huggingface))
+
+    # Prefer already-scanned local files before any Hugging Face attempt
+    local_by_name = {path.name: str(path) for path in model_paths}
+    need_remote = [name for name in to_download if name not in local_by_name]
+    if need_remote:
+        models.update(download_models(*need_remote, check_remote=huggingface))
+    for name in to_download:
+        if name in local_by_name:
+            models[name] = local_by_name[name]
 
     # MediaPipe models removed - use YOLO models instead for Python 3.13+ compatibility
 
@@ -137,7 +146,7 @@ def get_models(
     for key in invalid_keys:
         models.pop(key)
 
-    # Add local models while preserving order
+    # Add remaining local models while preserving order
     for path in model_paths:
         if path.name in models:
             continue

@@ -1017,6 +1017,9 @@ def reload_model_weights(sd_model=None, info=None, forced_reload=False):
             sd_model.to(devices.device)
             timer.record("move model to device")
 
+        # Match load_model(): register on shared before callbacks so extensions
+        # that read shared.sd_model (e.g. LoRA) do not see None mid-switch.
+        model_data.set_sd_model(sd_model)
         script_callbacks.model_loaded_callback(sd_model)
         timer.record("script callbacks")
 

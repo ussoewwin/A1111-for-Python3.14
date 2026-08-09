@@ -2,8 +2,6 @@ import math
 import os
 from pathlib import Path
 
-from cleanfid.inception_torchscript import InceptionV3W
-import clip
 from resize_right import resize
 import torch
 from torch import nn
@@ -17,6 +15,7 @@ from . import utils
 class InceptionV3FeatureExtractor(nn.Module):
     def __init__(self, device='cpu'):
         super().__init__()
+        from cleanfid.inception_torchscript import InceptionV3W
         path = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'k-diffusion'
         url = 'https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/metrics/inception-2015-12-05.pt'
         digest = 'f58cb9b6ec323ed63459aa4fb441fe750cfe39fafad6da5cb504a16f19e958f4'
@@ -36,6 +35,7 @@ class InceptionV3FeatureExtractor(nn.Module):
 class CLIPFeatureExtractor(nn.Module):
     def __init__(self, name='ViT-L/14@336px', device='cpu'):
         super().__init__()
+        import clip
         self.model = clip.load(name, device=device)[0].eval().requires_grad_(False)
         self.normalize = transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073),
                                               std=(0.26862954, 0.26130258, 0.27577711))

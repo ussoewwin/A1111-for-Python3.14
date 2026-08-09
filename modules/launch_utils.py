@@ -10,7 +10,6 @@ import importlib.metadata
 import platform
 import json
 import shlex
-import glob
 from functools import lru_cache
 
 from modules import cmd_args, errors
@@ -35,31 +34,20 @@ os.environ.setdefault('GRADIO_ANALYTICS_ENABLED', 'False')
 
 
 def check_python_version():
-    is_windows = platform.system() == "Windows"
     major = sys.version_info.major
     minor = sys.version_info.minor
     micro = sys.version_info.micro
 
-    if is_windows:
-        supported_minors = [10, 11, 12]
-    else:
-        supported_minors = [7, 8, 9, 10, 11, 12]
-
-    if not (major == 3 and minor in supported_minors):
+    if not (major == 3 and minor == 14):
         import modules.errors
 
         modules.errors.print_error_explanation(f"""
 INCOMPATIBLE PYTHON VERSION
 
-This program is tested with 3.10.6 Python, but you have {major}.{minor}.{micro}.
-If you encounter an error with "RuntimeError: Couldn't install torch." message,
-or any other error regarding unsuccessful package (library) installation,
-please downgrade (or upgrade) to the latest version of 3.10 Python
-and delete current Python and "venv" folder in WebUI's directory.
+This repository supports Python 3.14 only, but you have {major}.{minor}.{micro}.
+Install Python 3.14 and recreate the "venv" folder in WebUI's directory.
 
-You can download 3.10 Python from here: https://www.python.org/downloads/release/python-3106/
-
-{"Alternatively, use a binary release of WebUI: https://github.com/AUTOMATIC1111/stable-diffusion-webui/releases/tag/v1.0.0-pre" if is_windows else ""}
+You can download Python 3.14 from here: https://www.python.org/downloads/
 
 Use --skip-python-version-check to suppress this warning.
 """)
@@ -472,7 +460,8 @@ def requirements_met(requirements_file):
 
     with open(requirements_file, "r", encoding="utf8") as file:
         for line in file:
-            if line.strip() == "":
+            line = line.strip()
+            if line == "" or line.startswith("#"):
                 continue
 
             m = re.match(re_requirement, line)
@@ -522,30 +511,39 @@ def prepare_environment():
             # See https://intel.github.io/intel-extension-for-pytorch/index.html#installation for details.
             torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/")
             torch_command = os.environ.get('TORCH_COMMAND', f"pip install torch==2.0.0a0 intel-extension-for-pytorch==2.0.110+gitba7f6c1 --extra-index-url {torch_index_url}")
-    # Python 3.12 compatibility: use updated requirements file
-    if sys.version_info.minor >= 12:
-        if platform.system() == "Windows":
-            requirements_file = os.environ.get('REQS_FILE', "requirements_versions_py312_windows.txt")
-        else:
-            requirements_file = os.environ.get('REQS_FILE', "requirements_versions_py312.txt")
+    # Python 3.14 only
+    if platform.system() == "Windows":
+        requirements_file = os.environ.get('REQS_FILE', "requirements_versions_py314_windows.txt")
     else:
-        requirements_file = os.environ.get('REQS_FILE', "requirements_versions.txt")
+        requirements_file = os.environ.get('REQS_FILE', "requirements_versions_py314.txt")
     requirements_file_for_npu = os.environ.get('REQS_FILE_FOR_NPU', "requirements_npu.txt")
+    # open_clip: required for SD2 / SDXL text encoders (not openai CLIP).
+    # openai CLIP (`import clip`) is only needed by k-diffusion training metrics
+    # (evaluation.CLIPFeatureExtractor). WebUI sampling does not import that path;
+    # repositories/k-diffusion was patched so package import no longer pulls it in.
     openclip_package = os.environ.get('OPENCLIP_PACKAGE', "https://github.com/mlfoundations/open_clip/archive/bb6e834e9c70d9c27d0dc3ecedeebeaeb1ffad6b.zip")
     # Flash-Attention 2 source is platform-specific:
-    #   Windows: prebuilt wheel (cu130 + torch 2.10)
+    #   Windows: prebuilt wheel (cu132 + torch 2.13, cp314)
     #   Linux:   source build via PyPI (requires CUDA toolkit + nvcc, ~30min compile)
     #   Mac:     skipped (FA2 requires CUDA; MPS backend cannot use it)
     if platform.system() == "Windows":
-        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/flash_attn-2.8.3%2Bcu130torch2.10.0cxx11abiTRUE-cp312-cp312-win_amd64.whl')
+        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/flash_attn-2.8.4%2Bcu132torch2.13.0cxx11abiTRUE-cp314-cp314-win_amd64.whl')
         fa2_install_enabled = True
     elif platform.system() == "Linux":
-        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'flash-attn==2.8.3')
+        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'flash-attn==2.8.4')
         fa2_install_enabled = True
     else:
         flash_attn_package = None
         fa2_install_enabled = False
-    distutils_wheel = os.environ.get('DISTUTILS_WHEEL', 'https://huggingface.co/ussoewwin/distutils-3.12.0-py3-none-any/resolve/main/distutils-3.12.0-py3-none-any.whl')
+    distutils_wheel = os.environ.get(
+        'DISTUTILS_WHEEL',
+        'https://huggingface.co/ussoewwin/distutils/resolve/main/distutils-3.14.0-py3-none-any.whl',
+    )
+    # Gradio 3.41.2 HF wheel (METADATA numpy/pillow version pins removed).
+    gradio_package = os.environ.get(
+        'GRADIO_PACKAGE',
+        'https://huggingface.co/ussoewwin/gradio3.41.2/resolve/main/gradio-3.41.2-py3-none-any.whl',
+    )
 
     assets_repo = os.environ.get('ASSETS_REPO', "https://github.com/AUTOMATIC1111/stable-diffusion-webui-assets.git")
     stable_diffusion_repo = os.environ.get('STABLE_DIFFUSION_REPO', "https://github.com/Stability-AI/stablediffusion.git")
@@ -595,13 +593,11 @@ def prepare_environment():
     if not is_installed("packaging"):
         run(f'"{python}" -m pip install {packaging_wheel} --no-deps --no-index', "Installing packaging", "Couldn't install packaging", live=False)
 
-    # Install distutils for Python 3.12 first (before anything else)
-    if sys.version_info >= (3, 12):
-        try:
-            from distutils.version import StrictVersion
-        except ImportError:
-            distutils_url = "https://huggingface.co/ussoewwin/distutils-3.12.0-py3-none-any/resolve/main/distutils-3.12.0-py3-none-any.whl"
-            run(f'"{python}" -m pip install {distutils_url} --no-deps --no-index', "Installing distutils", "Couldn't install distutils", live=False)
+    # Install distutils stub (stdlib distutils removed; required on Python 3.14)
+    try:
+        from distutils.version import StrictVersion
+    except ImportError:
+        run(f'"{python}" -m pip install {distutils_wheel} --no-deps --no-index', "Installing distutils", "Couldn't install distutils", live=False)
 
     # xformers installation removed - install manually if needed
     # Copy xformers_fix files to xformers installation directory (only if xformers is installed)
@@ -628,14 +624,7 @@ def prepare_environment():
         print(f"Warning: Failed to copy xformers_fix files: {e}")
 
     # PyTorch installation removed - install manually if needed
-    # Install distutils for Python 3.12 if needed (only from HuggingFace)
-    if sys.version_info >= (3, 12):
-        try:
-            from distutils.version import StrictVersion
-        except ImportError:
-            distutils_url = "https://huggingface.co/ussoewwin/distutils-3.12.0-py3-none-any/resolve/main/distutils-3.12.0-py3-none-any.whl"
-            run(f'"{python}" -m pip install {distutils_url} --no-deps --no-index', "Installing distutils", "Couldn't install distutils", live=False)
-    
+
     # Check if torch is installed, but don't install it automatically
     if not is_installed("torch") or not is_installed("torchvision"):
         print("Warning: PyTorch is not installed. Please install it manually before running the web UI.")
@@ -660,7 +649,7 @@ def prepare_environment():
     packaging_wheel = os.environ.get('PACKAGING_WHEEL', 'https://huggingface.co/ussoewwin/packaging-25.0-py3-none-any/resolve/main/packaging-25.0-py3-none-any.whl')
     if not is_installed("packaging"):
         run(f'"{python}" -m pip install {packaging_wheel} --no-deps --no-index', "Installing packaging", "Couldn't install packaging", live=False)
-    
+
     if not is_installed("open_clip"):
         run_pip(f"install {openclip_package}", "open_clip")
         startup_timer.record("install open_clip")
@@ -689,36 +678,30 @@ def prepare_environment():
     if not os.path.isfile(requirements_file):
         requirements_file = os.path.join(script_path, requirements_file)
 
-    # Ensure packaging is installed for Python 3.12
     run_pip("install --upgrade packaging", "packaging")
 
-    # Fix numpy/scipy binary incompatibility issue (install from local whl files)
-    # Install numpy BEFORE requirements.txt to avoid module cache issues
-    # If numpy is installed via requirements.txt and then reinstalled, modules already imported will use cached version
-    whl_dir = os.path.join(script_path, "whl")
-    numpy_whl_pattern = os.path.join(whl_dir, "numpy-*.whl")
-    numpy_whl_files = glob.glob(numpy_whl_pattern)
-    if numpy_whl_files:
-        numpy_whl = numpy_whl_files[0]  # Use first matching whl file
-        run(f'"{python}" -m pip uninstall numpy -y', "uninstalling numpy", "Couldn't uninstall numpy", live=False)
-        run(f'"{python}" -m pip install "{numpy_whl}" --no-deps', "Installing numpy from local whl", "Couldn't install numpy", live=False)
-        print(f"[INFO] Installed numpy from local whl: {numpy_whl}")
-    else:
-        # Fallback to pip if local whl not found
-        run(f'"{python}" -m pip uninstall numpy -y', "uninstalling numpy", "Couldn't uninstall numpy", live=False)
-        run(f'"{python}" -m pip install --no-cache-dir numpy==1.26.4', "Installing numpy 1.26.4", "Couldn't install numpy 1.26.4", live=False)
+    # Pin numpy==2.5.1 before -r (same premise as Stable-Diffusion-WebUI-Forge-Nunchaku).
+    # Install early so already-imported modules do not keep a stale numpy.
+    run(f'"{python}" -m pip uninstall numpy -y', "uninstalling numpy", "Couldn't uninstall numpy", live=False)
+    run(f'"{python}" -m pip install --no-cache-dir numpy==2.5.1', "Installing numpy 2.5.1", "Couldn't install numpy 2.5.1", live=False)
+    print("[INFO] Installed numpy==2.5.1 from PyPI")
+
+    # Gradio from HF (METADATA version pins removed)
+    run_pip(f'install "{gradio_package}"', "gradio")
+    print(f"[INFO] Installed gradio from: {gradio_package}")
+    startup_timer.record("install gradio")
 
     if not requirements_met(requirements_file):
         # only-if-needed: do not upgrade already-satisfied deps (esp. torch pulled by accelerate/etc.)
         run_pip(f"install -U --upgrade-strategy only-if-needed -r \"{requirements_file}\"", "requirements")
         startup_timer.record("install requirements")
     
-    # scipy install: unified across platforms via PyPI to match numpy 1.26.4 dtype layout
+    # scipy via PyPI to match numpy 2.5.1
     run(f'"{python}" -m pip uninstall scipy -y', "uninstalling scipy", "Couldn't uninstall scipy", live=False)
     run(f'"{python}" -m pip install --no-cache-dir scipy==1.16.1', "Installing scipy 1.16.1", "Couldn't install scipy 1.16.1", live=False)
     print("[INFO] Installed scipy 1.16.1 from PyPI")
     
-    # Auto-fix clip.py for Python 3.12 packaging import issue (AFTER requirements installation)
+    # Auto-fix clip.py packaging import (AFTER requirements installation)
     def fix_clip_packaging_import():
         if platform.system() == "Windows":
             clip_py_path = os.path.join(script_path, "venv", "Lib", "site-packages", "clip", "clip.py")
@@ -729,23 +712,21 @@ def prepare_environment():
             try:
                 with open(clip_py_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                
-                # Fix 1: replace "from pkg_resources import packaging" with "from packaging import version"
+
                 if "from pkg_resources import packaging" in content:
                     content = content.replace("from pkg_resources import packaging", "from packaging import version")
                     print("[INFO] Fixed clip.py import: replaced pkg_resources with direct packaging import")
-                
-                # Fix 2: replace "packaging.version.parse" with "version.parse"
+
                 if "packaging.version.parse" in content:
                     content = content.replace("packaging.version.parse", "version.parse")
                     print("[INFO] Fixed clip.py usage: replaced packaging.version.parse with version.parse")
-                
+
                 with open(clip_py_path, "w", encoding="utf-8") as f:
                     f.write(content)
-                print("[INFO] Successfully auto-fixed clip.py for Python 3.12")
+                print("[INFO] Successfully auto-fixed clip.py packaging imports")
             except Exception as e:
                 print(f"[WARNING] Could not auto-fix clip.py: {e}")
-    
+
     fix_clip_packaging_import()
 
     # Fix protobuf runtime_version import error
@@ -763,6 +744,9 @@ def prepare_environment():
 
     if not args.skip_install:
         run_extensions_installers(settings_file=args.ui_settings_file)
+        # Keep Forge-aligned pin if an extension installer drifted numpy.
+        run(f'"{python}" -m pip install --force-reinstall --no-deps --no-cache-dir numpy==2.5.1', "re-pin: numpy 2.5.1", "Couldn't install numpy 2.5.1", live=False)
+        print("[INFO] Re-pinned numpy==2.5.1 after extensions")
 
     if args.update_check:
         version_check(commit)

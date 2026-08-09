@@ -20,13 +20,13 @@ Because this fork is Python-3.12-only, startup auto-selects a requirements file 
 
 | Environment | Requirements file |
 |-------------|-------------------|
-| Windows | `requirements_versions_py312_windows.txt` |
-| Linux / macOS | `requirements_versions_py312.txt` |
+| Windows | `requirements_versions_py314_windows.txt` |
+| Linux / macOS | `requirements_versions_py314.txt` |
 
 Both files are currently byte-identical (shared baseline). Platform-specific behaviour is absorbed by the launch_utils branches described below.
 
 ### 3. scikit-image build avoidance (Windows)
-- `requirements_versions_py312_windows.txt` pins `scikit-image>=0.22.0`.
+- `requirements_versions_py314_windows.txt` pins `scikit-image>=0.22.0`.
 - A version with a prebuilt wheel is used so that a Visual Studio C/C++ toolchain is not required.
 - Aligned with `numpy==1.26.4` so the dtype layout matches the scipy wheel described below.
 
@@ -71,14 +71,14 @@ A patch that removes OpenAI CLIP's `pkg_resources` dependency is applied to the 
 - Linux / macOS: `venv/lib/pythonX.Y/site-packages/clip/clip.py` (major/minor resolved dynamically from the running interpreter)
 
 ### 8. transformers 5.4+ baseline / 4.x shim removal
-**Files**: `requirements_versions_py312_windows.txt`, `requirements_versions_py312.txt`, `modules/sd_disable_initialization.py`
+**Files**: `requirements_versions_py314_windows.txt`, `requirements_versions_py314.txt`, `modules/sd_disable_initialization.py`
 
 - Baseline raised to `transformers==5.4.0`.
 - The transformers 4.x compatibility hack in `sd_disable_initialization.py` has been removed.
 - This resolves the `AttributeError` that occurred during quick model loading.
 
 ### 9. protobuf v7 compatibility
-**Files**: `requirements_versions_py312_windows.txt`, `requirements_versions_py312.txt`
+**Files**: `requirements_versions_py314_windows.txt`, `requirements_versions_py314.txt`
 
 - Pinned to `protobuf==7.34.1` (previously 4.x; before that 3.20.x — a large jump).
 - Upstream A1111 does not assume Python 3.12, so following the newer protobuf line is necessary.
@@ -134,8 +134,8 @@ stable-diffusion-webui/
 │   ├── LINUX_MAC_PY312_STARTUP_FIX.md     # Linux / macOS startup fix design
 │   ├── FA2_direct_load_design.md          # FA2 direct-load design
 │   └── INCIDENT_2026-04-22_A1111_Cursor_git_disabled.md
-├── requirements_versions_py312.txt         # Linux / macOS
-├── requirements_versions_py312_windows.txt # Windows
+├── requirements_versions_py314.txt         # Linux / macOS
+├── requirements_versions_py314_windows.txt # Windows
 ├── modules/launch_utils.py                 # Branching logic described above
 ├── modules/sd_disable_initialization.py    # transformers 5.x compatibility
 └── configs/v1-inference.yaml               # OOM mitigation (use_checkpoint: True)

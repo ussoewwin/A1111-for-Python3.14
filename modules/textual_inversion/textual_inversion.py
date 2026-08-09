@@ -127,6 +127,8 @@ class EmbeddingDatabase:
         return self.register_embedding_by_name(embedding, model, embedding.name)
 
     def register_embedding_by_name(self, embedding, model, name):
+        if model is None or getattr(model, "cond_stage_model", None) is None:
+            return None
         ids = model.cond_stage_model.tokenize([name])[0]
         first_id = ids[0]
         if first_id not in self.ids_lookup:
@@ -150,6 +152,8 @@ class EmbeddingDatabase:
         return embedding
 
     def get_expected_shape(self):
+        if shared.sd_model is None or getattr(shared.sd_model, "cond_stage_model", None) is None:
+            return -1
         devices.torch_npu_set_device()
         vec = shared.sd_model.cond_stage_model.encode_embedding_init_text(",", 1)
         return vec.shape[1]
@@ -210,6 +214,9 @@ class EmbeddingDatabase:
                     continue
 
     def load_textual_inversion_embeddings(self, force_reload=False):
+        if shared.sd_model is None or getattr(shared.sd_model, "cond_stage_model", None) is None:
+            return
+
         if not force_reload:
             need_reload = False
             for embdir in self.embedding_dirs.values():
@@ -224,6 +231,8 @@ class EmbeddingDatabase:
         self.word_embeddings.clear()
         self.skipped_embeddings.clear()
         self.expected_shape = self.get_expected_shape()
+        if self.expected_shape == -1:
+            return
 
         for embdir in self.embedding_dirs.values():
             self.load_from_dir(embdir)

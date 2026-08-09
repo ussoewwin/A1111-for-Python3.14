@@ -34,9 +34,9 @@ The following popular extensions are built-in and ready to use out of the box:
 
 Native support for **[RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF)** samplers in the A1111 **Sampling method** dropdown (100+ advanced RES / Bongmath / hybrid RK methods), plus related schedule types such as `beta57` and `bong_tangent`. Generation runs through an A1111-side shim; the vendored RES4LYF sources under `modules/RES4LYF/` are left unmodified.
 
-### Python 3.12 Native
+### Python 3.14 Native
 
-Fully ported to Python 3.12. No `pkg_resources` hacks, no legacy compatibility layers. All dependency conflicts (NumPy, SciPy, `clip.py`) are handled automatically at startup.
+Fully ported to Python 3.14. No `pkg_resources` hacks, no legacy compatibility layers. All dependency conflicts (NumPy, SciPy, `clip.py`) are handled automatically at startup.
 
 ### Flash-Attention 2 with Graceful Fallback
 
@@ -52,11 +52,11 @@ Prebuilt Windows wheels included. Linux builds from source automatically. macOS 
 
 ## Python Version Support
 
-**This repository supports Python 3.12 only.**
+**This repository supports Python 3.14 only.**
 
-Other Python versions are not supported. Please ensure you are using Python 3.12 before proceeding with installation.
+Other Python versions are not supported. Please ensure you are using Python 3.14 before proceeding with installation.
 
-**Note:** Not all extensions may be compatible with Python 3.12. Some extensions may require additional modifications or may not work correctly.
+**Note:** Not all extensions may be compatible with Python 3.14. Some extensions may require additional modifications or may not work correctly.
 
 ## Platform Support
 
@@ -93,7 +93,7 @@ Pick the section for your OS and follow the steps in order.
 
 **Install steps**
 
-1. Install Python 3.12.
+1. Install Python 3.14.
 
 2. Create and activate a virtual environment:
    ```cmd
@@ -148,7 +148,7 @@ Pick the section for your OS and follow the steps in order.
 
 **Install steps**
 
-1. Install Python 3.12.
+1. Install Python 3.14.
 
 2. Create and activate a virtual environment:
    ```bash
@@ -200,7 +200,7 @@ Pick the section for your OS and follow the steps in order.
 
 **Install steps**
 
-1. Install Python 3.12.
+1. Install Python 3.14.
 
 2. Create and activate a virtual environment:
    ```bash
@@ -249,7 +249,7 @@ Pick the section for your OS and follow the steps in order.
 - **NumPy**: local Windows `whl/numpy-*.whl` is used when present (Windows only); otherwise NumPy is installed from PyPI at the pinned version.
 - **clip.py `pkg_resources` auto-fix**: targets `venv/Lib/...` on Windows and `venv/lib/pythonX.Y/...` on Linux / macOS (major / minor resolved dynamically).
 
-See [`md/LINUX_MAC_PY312_STARTUP_FIX.md`](md/LINUX_MAC_PY312_STARTUP_FIX.md) for the full fix design and [`md/PYTHON312_COMPATIBILITY.md`](md/PYTHON312_COMPATIBILITY.md) for the overall Python 3.12 compatibility notes.
+See [`md/LINUX_MAC_PY312_STARTUP_FIX.md`](md/LINUX_MAC_PY312_STARTUP_FIX.md) for the full fix design and [`md/PYTHON312_COMPATIBILITY.md`](md/PYTHON312_COMPATIBILITY.md) for the overall Python 3.14 compatibility notes.
 
 ## Changelog
 

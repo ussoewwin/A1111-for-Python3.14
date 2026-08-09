@@ -252,6 +252,10 @@ def reload_vae_weights(sd_model=None, vae_file=unspecified):
     if not sd_model:
         sd_model = shared.sd_model
 
+    # Model may still be loading in a background thread, or briefly cleared during checkpoint switch.
+    if sd_model is None:
+        return None
+
     checkpoint_info = sd_model.sd_checkpoint_info
     checkpoint_file = checkpoint_info.filename
 
