@@ -6,6 +6,8 @@ This document contains release notes for versions v1.01 through v3.0.0. Through 
 
 ## v3.0.0
 
+### 🎉 MAJOR UPDATE: v3.0.0 - Python 3.14 Full Renewal!
+
 - **Summary**: Full renewal for **Python 3.14** — this fork now targets Python 3.14 only (`webui.sh` / install docs / runtime gate). Default first-install CUDA stack is `torch==2.13.0+cu132` and `torchvision==0.28.0+cu132` (torchaudio omitted; matches FA2 `2.8.4+cu132torch2.13.0`), with Windows FA2 prebuilt wheels and Linux FA2 source builds against CUDA toolkit 13.2. Includes the CPython 3.14 `shared.sd_model` LOAD_ATTR shadow fix, NumPy / SciPy / Gradio pins for 3.14, and README / Linux–macOS launch alignment to the same stack.
 - **Release Note**: [v3.0.0 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.0)
 

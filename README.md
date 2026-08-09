@@ -3,6 +3,12 @@
 A web interface for Stable Diffusion, implemented using the Gradio library.
 ## Key Features & Improvements
 
+## 🎉 MAJOR UPDATE: v3.0.0 - Python 3.14 Full Renewal!
+
+**This repository is Python 3.14–only** (`ussoewwin/A1111-for-Python3.14`). Default first-install CUDA stack: `torch==2.13.0+cu132` + `torchvision==0.28.0+cu132`, Flash-Attention 2 **2.8.4**, plus the CPython 3.14 `shared.sd_model` LOAD_ATTR fix.
+
+For detailed technical explanation, see [v3.0.0 Release Notes](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.0)
+
 ## 🎉 MAJOR UPDATE: v2.0 - Pony and Illustrious (IL) SDXL Full Support Added!
 
 For detailed technical explanation, see [v2.0 Release Notes](https://github.com/ussoewwin/A1111-for-Python3.12/releases/tag/v2.0)
