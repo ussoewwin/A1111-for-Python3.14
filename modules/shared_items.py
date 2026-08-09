@@ -182,3 +182,6 @@ class Shared(sys.modules[__name__].__class__):
 
 
 sys.modules['modules.shared'].__class__ = Shared
+# Drop any module-dict shadow so Shared.sd_model is always used (CPython 3.14
+# LOAD_ATTR specialization + __dict__['sd_model']=None → intermittent None).
+sys.modules['modules.shared'].__dict__.pop('sd_model', None)

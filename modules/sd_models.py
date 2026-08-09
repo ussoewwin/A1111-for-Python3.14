@@ -704,29 +704,36 @@ class SdModelData:
         self.sd_model = None
         self.loaded_sd_models = []
         self.was_loaded_at_least_once = False
-        self.lock = threading.Lock()
+        # RLock: get_sd_model / reload_model_weights may call load_model while already holding the lock.
+        # Serialize all loads so startup Thread and process_images cannot clear sd_model mid-generation.
+        self.lock = threading.RLock()
 
     def get_sd_model(self):
-        if self.was_loaded_at_least_once:
+        if self.sd_model is not None:
             return self.sd_model
 
-        if self.sd_model is None:
-            with self.lock:
-                if self.sd_model is not None or self.was_loaded_at_least_once:
-                    return self.sd_model
+        with self.lock:
+            if self.sd_model is not None:
+                return self.sd_model
 
-                try:
-                    load_model()
+            # Do not sticky-return None after was_loaded_at_least_once: another loader may have
+            # cleared the pointer under this lock, or a prior load failed; always retry once.
+            try:
+                load_model()
 
-                except Exception as e:
-                    errors.display(e, "loading stable diffusion model", full_traceback=True)
-                    print("", file=sys.stderr)
-                    print("Stable diffusion model failed to load", file=sys.stderr)
-                    self.sd_model = None
+            except Exception as e:
+                errors.display(e, "loading stable diffusion model", full_traceback=True)
+                print("", file=sys.stderr)
+                print("Stable diffusion model failed to load", file=sys.stderr)
+                # Do not clear a live model after a failed load attempt (keep-old semantics).
+                if self.sd_model is None:
+                    _trace_sd_model_clear("get_sd_model_exception_still_none")
 
-        return self.sd_model
+            return self.sd_model
 
     def set_sd_model(self, v, already_loaded=False):
+        if v is None and self.sd_model is not None:
+            _trace_sd_model_clear("set_sd_model(None)")
         self.sd_model = v
         if already_loaded:
             sd_vae.base_vae = getattr(v, "base_vae", None)
@@ -743,6 +750,24 @@ class SdModelData:
 
 
 model_data = SdModelData()
+
+
+def _trace_sd_model_clear(reason):
+    """Log every intentional clear of model_data.sd_model (thread + stack)."""
+    import traceback
+    tid = threading.get_ident()
+    tname = threading.current_thread().name
+    print(
+        f"[A1111] CLEAR model_data.sd_model reason={reason} thread={tname}/{tid}",
+        file=sys.stderr,
+    )
+    traceback.print_stack(file=sys.stderr, limit=24)
+
+
+def peek_sd_model():
+    """Return model_data.sd_model under lock without triggering load_model."""
+    with model_data.lock:
+        return model_data.sd_model
 
 
 def get_empty_cond(sd_model):
@@ -813,92 +838,101 @@ def load_model(checkpoint_info=None, already_loaded_state_dict=None):
     from modules import sd_hijack
     checkpoint_info = checkpoint_info or select_checkpoint()
 
-    timer = Timer()
+    with model_data.lock:
+        timer = Timer()
 
-    if model_data.sd_model:
-        send_model_to_trash(model_data.sd_model)
-        model_data.sd_model = None
-        devices.torch_gc()
+        # Keep the previous model pointer until the new model is fully ready.
+        # Clearing early created a None window that scripts (ControlNet / MultiDiffusion)
+        # and concurrent readers observed mid-generation.
+        old_model = model_data.sd_model
+        timer.record("prepare replace (keep old until ready)")
 
-    timer.record("unload existing model")
+        if already_loaded_state_dict is not None:
+            state_dict = already_loaded_state_dict
+        else:
+            state_dict = get_checkpoint_state_dict(checkpoint_info, timer)
 
-    if already_loaded_state_dict is not None:
-        state_dict = already_loaded_state_dict
-    else:
-        state_dict = get_checkpoint_state_dict(checkpoint_info, timer)
+        checkpoint_config = sd_models_config.find_checkpoint_config(state_dict, checkpoint_info)
+        clip_is_included_into_sd = any(x for x in [sd1_clip_weight, sd1_clip_weight_flat, sd2_clip_weight, sdxl_clip_weight, sdxl_refiner_clip_weight] if x in state_dict)
 
-    checkpoint_config = sd_models_config.find_checkpoint_config(state_dict, checkpoint_info)
-    clip_is_included_into_sd = any(x for x in [sd1_clip_weight, sd1_clip_weight_flat, sd2_clip_weight, sdxl_clip_weight, sdxl_refiner_clip_weight] if x in state_dict)
+        timer.record("find config")
 
-    timer.record("find config")
+        sd_config = OmegaConf.load(checkpoint_config)
+        repair_config(sd_config, state_dict)
 
-    sd_config = OmegaConf.load(checkpoint_config)
-    repair_config(sd_config, state_dict)
+        timer.record("load config")
 
-    timer.record("load config")
+        print(f"Creating model from config: {checkpoint_config}")
 
-    print(f"Creating model from config: {checkpoint_config}")
+        sd_model = None
+        try:
+            with sd_disable_initialization.DisableInitialization(disable_clip=clip_is_included_into_sd or shared.cmd_opts.do_not_download_clip):
+                with sd_disable_initialization.InitializeOnMeta():
+                    sd_model = instantiate_from_config(sd_config.model, state_dict)
 
-    sd_model = None
-    try:
-        with sd_disable_initialization.DisableInitialization(disable_clip=clip_is_included_into_sd or shared.cmd_opts.do_not_download_clip):
+        except Exception as e:
+            errors.display(e, "creating model quickly", full_traceback=True)
+
+        if sd_model is None:
+            print('Failed to create model quickly; will retry using slow method.', file=sys.stderr)
+
             with sd_disable_initialization.InitializeOnMeta():
                 sd_model = instantiate_from_config(sd_config.model, state_dict)
 
-    except Exception as e:
-        errors.display(e, "creating model quickly", full_traceback=True)
+        sd_model.used_config = checkpoint_config
 
-    if sd_model is None:
-        print('Failed to create model quickly; will retry using slow method.', file=sys.stderr)
+        timer.record("create model")
 
-        with sd_disable_initialization.InitializeOnMeta():
-            sd_model = instantiate_from_config(sd_config.model, state_dict)
+        if shared.cmd_opts.no_half:
+            weight_dtype_conversion = None
+        else:
+            weight_dtype_conversion = {
+                'first_stage_model': None,
+                'alphas_cumprod': None,
+                '': torch.float16,
+            }
 
-    sd_model.used_config = checkpoint_config
+        with sd_disable_initialization.LoadStateDictOnMeta(state_dict, device=model_target_device(sd_model), weight_dtype_conversion=weight_dtype_conversion):
+            load_model_weights(sd_model, checkpoint_info, state_dict, timer)
 
-    timer.record("create model")
+        timer.record("load weights from state dict")
 
-    if shared.cmd_opts.no_half:
-        weight_dtype_conversion = None
-    else:
-        weight_dtype_conversion = {
-            'first_stage_model': None,
-            'alphas_cumprod': None,
-            '': torch.float16,
-        }
+        send_model_to_device(sd_model)
+        timer.record("move model to device")
 
-    with sd_disable_initialization.LoadStateDictOnMeta(state_dict, device=model_target_device(sd_model), weight_dtype_conversion=weight_dtype_conversion):
-        load_model_weights(sd_model, checkpoint_info, state_dict, timer)
+        sd_hijack.model_hijack.hijack(sd_model)
 
-    timer.record("load weights from state dict")
+        timer.record("hijack")
 
-    send_model_to_device(sd_model)
-    timer.record("move model to device")
+        sd_model.eval()
+        model_data.set_sd_model(sd_model)
+        model_data.was_loaded_at_least_once = True
 
-    sd_hijack.model_hijack.hijack(sd_model)
+        if old_model is not None and old_model is not sd_model:
+            try:
+                model_data.loaded_sd_models.remove(old_model)
+            except ValueError:
+                pass
+            send_model_to_trash(old_model)
+            devices.torch_gc()
+            timer.record("trash previous model")
 
-    timer.record("hijack")
+        sd_hijack.model_hijack.embedding_db.load_textual_inversion_embeddings(force_reload=True)  # Reload embeddings after model load as they may or may not fit the model
 
-    sd_model.eval()
-    model_data.set_sd_model(sd_model)
-    model_data.was_loaded_at_least_once = True
+        timer.record("load textual inversion embeddings")
 
-    sd_hijack.model_hijack.embedding_db.load_textual_inversion_embeddings(force_reload=True)  # Reload embeddings after model load as they may or may not fit the model
+        script_callbacks.model_loaded_callback(sd_model)
 
-    timer.record("load textual inversion embeddings")
+        timer.record("scripts callbacks")
 
-    script_callbacks.model_loaded_callback(sd_model)
+        with devices.autocast(), torch.no_grad():
+            sd_model.cond_stage_model_empty_prompt = get_empty_cond(sd_model)
 
-    timer.record("scripts callbacks")
+        timer.record("calculate empty prompt")
 
-    with devices.autocast(), torch.no_grad():
-        sd_model.cond_stage_model_empty_prompt = get_empty_cond(sd_model)
+        print(f"Model loaded in {timer.summary()}.")
 
-    timer.record("calculate empty prompt")
-
-    print(f"Model loaded in {timer.summary()}.")
-
-    return sd_model
+        return sd_model
 
 
 def reuse_model_from_already_loaded(sd_model, checkpoint_info, timer):
@@ -946,7 +980,7 @@ def reuse_model_from_already_loaded(sd_model, checkpoint_info, timer):
     elif shared.opts.sd_checkpoints_limit > 1 and len(model_data.loaded_sd_models) < shared.opts.sd_checkpoints_limit:
         print(f"Loading model {checkpoint_info.title} ({len(model_data.loaded_sd_models) + 1} out of {shared.opts.sd_checkpoints_limit})")
 
-        model_data.sd_model = None
+        # Do not clear here — load_model keeps the old pointer until the new model is ready.
         load_model(checkpoint_info)
         return model_data.sd_model
     elif len(model_data.loaded_sd_models) > 0:
@@ -966,68 +1000,82 @@ def reuse_model_from_already_loaded(sd_model, checkpoint_info, timer):
 def reload_model_weights(sd_model=None, info=None, forced_reload=False):
     checkpoint_info = info or select_checkpoint()
 
-    timer = Timer()
+    with model_data.lock:
+        timer = Timer()
 
-    if not sd_model:
-        sd_model = model_data.sd_model
+        if not sd_model:
+            sd_model = model_data.sd_model
 
-    if sd_model is None:  # previous model load failed
-        current_checkpoint_info = None
-    else:
-        current_checkpoint_info = sd_model.sd_checkpoint_info
-        if check_fp8(sd_model) != devices.fp8:
-            # load from state dict again to prevent extra numerical errors
-            forced_reload = True
-        elif sd_model.sd_model_checkpoint == checkpoint_info.filename and not forced_reload:
+        if sd_model is None:  # previous model load failed
+            current_checkpoint_info = None
+        else:
+            current_checkpoint_info = sd_model.sd_checkpoint_info
+            if check_fp8(sd_model) != devices.fp8:
+                # load from state dict again to prevent extra numerical errors
+                forced_reload = True
+            elif sd_model.sd_model_checkpoint == checkpoint_info.filename and not forced_reload:
+                return sd_model
+
+        sd_model = reuse_model_from_already_loaded(sd_model, checkpoint_info, timer)
+        if not forced_reload and sd_model is not None and sd_model.sd_checkpoint_info.filename == checkpoint_info.filename:
             return sd_model
 
-    sd_model = reuse_model_from_already_loaded(sd_model, checkpoint_info, timer)
-    if not forced_reload and sd_model is not None and sd_model.sd_checkpoint_info.filename == checkpoint_info.filename:
+        if sd_model is not None:
+            sd_unet.apply_unet("None")
+            send_model_to_cpu(sd_model)
+            sd_hijack.model_hijack.undo_hijack(sd_model)
+
+        state_dict = get_checkpoint_state_dict(checkpoint_info, timer)
+
+        checkpoint_config = sd_models_config.find_checkpoint_config(state_dict, checkpoint_info)
+
+        timer.record("find config")
+
+        if sd_model is None or checkpoint_config != sd_model.used_config:
+            if sd_model is not None:
+                send_model_to_trash(sd_model)
+
+            load_model(checkpoint_info, already_loaded_state_dict=state_dict)
+            return model_data.sd_model
+
+        try:
+            load_model_weights(sd_model, checkpoint_info, state_dict, timer)
+        except Exception:
+            print("Failed to load checkpoint, restoring previous")
+            load_model_weights(sd_model, current_checkpoint_info, None, timer)
+            raise
+        finally:
+            sd_hijack.model_hijack.hijack(sd_model)
+            timer.record("hijack")
+
+            if not sd_model.lowvram:
+                sd_model.to(devices.device)
+                timer.record("move model to device")
+
+            # Match load_model(): register on shared before callbacks so extensions
+            # that read shared.sd_model (e.g. LoRA) do not see None mid-switch.
+            model_data.set_sd_model(sd_model)
+            script_callbacks.model_loaded_callback(sd_model)
+            timer.record("script callbacks")
+
+        print(f"Weights loaded in {timer.summary()}.")
+
+        model_data.set_sd_model(sd_model)
+        sd_unet.apply_unet()
+
         return sd_model
 
-    if sd_model is not None:
-        sd_unet.apply_unet("None")
-        send_model_to_cpu(sd_model)
-        sd_hijack.model_hijack.undo_hijack(sd_model)
 
-    state_dict = get_checkpoint_state_dict(checkpoint_info, timer)
-
-    checkpoint_config = sd_models_config.find_checkpoint_config(state_dict, checkpoint_info)
-
-    timer.record("find config")
-
-    if sd_model is None or checkpoint_config != sd_model.used_config:
-        if sd_model is not None:
-            send_model_to_trash(sd_model)
-
-        load_model(checkpoint_info, already_loaded_state_dict=state_dict)
-        return model_data.sd_model
-
-    try:
-        load_model_weights(sd_model, checkpoint_info, state_dict, timer)
-    except Exception:
-        print("Failed to load checkpoint, restoring previous")
-        load_model_weights(sd_model, current_checkpoint_info, None, timer)
-        raise
-    finally:
-        sd_hijack.model_hijack.hijack(sd_model)
-        timer.record("hijack")
-
-        if not sd_model.lowvram:
-            sd_model.to(devices.device)
-            timer.record("move model to device")
-
-        # Match load_model(): register on shared before callbacks so extensions
-        # that read shared.sd_model (e.g. LoRA) do not see None mid-switch.
-        model_data.set_sd_model(sd_model)
-        script_callbacks.model_loaded_callback(sd_model)
-        timer.record("script callbacks")
-
-    print(f"Weights loaded in {timer.summary()}.")
-
-    model_data.set_sd_model(sd_model)
-    sd_unet.apply_unet()
-
+def ensure_sd_model():
+    """Return a loaded SD model, loading if needed. Raises if still unavailable."""
+    sd_model = model_data.get_sd_model()
+    if sd_model is None:
+        with model_data.lock:
+            if model_data.sd_model is None:
+                load_model()
+            sd_model = model_data.sd_model
+    if sd_model is None:
+        raise RuntimeError("Stable Diffusion model is not loaded")
     return sd_model
 
 
@@ -1037,10 +1085,70 @@ def unload_model_weights(sd_model=None, info=None):
     return sd_model
 
 
+def _tome_target(sd_model):
+    """Same expression as tomesd.remove_patch / apply_patch unwrap."""
+    return sd_model.unet if hasattr(sd_model, "unet") else sd_model
+
+
+def _clear_measured_none_unet(sd_model):
+    """Clear only a measured `unet is None` so tomesd's hasattr becomes False."""
+    if "unet" in getattr(sd_model, "__dict__", {}):
+        del sd_model.__dict__["unet"]
+        return "instance_dict"
+    modules = sd_model.__dict__.get("_modules") if hasattr(sd_model, "__dict__") else None
+    if isinstance(modules, dict) and "unet" in modules and modules["unet"] is None:
+        del modules["unet"]
+        return "_modules"
+    delattr(sd_model, "unet")
+    return "delattr"
+
+
 def apply_token_merging(sd_model, token_merging_ratio):
     """
     Applies speed and memory optimizations from tomesd.
     """
+    if sd_model is None:
+        sd_model = ensure_sd_model()
+
+    has_unet = hasattr(sd_model, "unet")
+    unet_val = getattr(sd_model, "unet", None) if has_unet else None
+    tome_target = _tome_target(sd_model)
+    print(
+        f"[DEBUG] apply_token_merging entry: type={type(sd_model).__name__} "
+        f"id={id(sd_model)} ratio={token_merging_ratio} "
+        f"hasattr_unet={has_unet} "
+        f"unet={type(unet_val).__name__ if unet_val is not None else ('None' if has_unet else 'n/a')} "
+        f"tome_target_is_none={tome_target is None}",
+        file=sys.stderr,
+    )
+
+    # tomesd: model = model.unet if hasattr(model, "unet") else model; model.named_modules()
+    # Traceback AttributeError NoneType.named_modules means that unwrap was None.
+    if tome_target is None:
+        if has_unet and unet_val is None:
+            where = _clear_measured_none_unet(sd_model)
+            print(
+                f"[A1111] Cleared measured unet=None via {where} before ToMe",
+                file=sys.stderr,
+            )
+        else:
+            sd_model = ensure_sd_model()
+        has_unet = hasattr(sd_model, "unet")
+        unet_val = getattr(sd_model, "unet", None) if has_unet else None
+        tome_target = _tome_target(sd_model)
+        print(
+            f"[DEBUG] apply_token_merging after recover: type={type(sd_model).__name__} "
+            f"hasattr_unet={has_unet} "
+            f"unet={type(unet_val).__name__ if unet_val is not None else ('None' if has_unet else 'n/a')} "
+            f"tome_target_is_none={tome_target is None}",
+            file=sys.stderr,
+        )
+        if tome_target is None:
+            raise RuntimeError(
+                "Token merging aborted: tomesd unwrap target is None "
+                f"(type={type(sd_model).__name__}, hasattr_unet={has_unet}, "
+                f"unet={unet_val!r})"
+            )
 
     current_token_merging_ratio = getattr(sd_model, 'applied_token_merged_ratio', 0)
 

@@ -703,12 +703,6 @@ class Script(scripts.Script):
             encoder_tile_size:int, decoder_tile_size:int, 
             vae_to_gpu:bool, fast_decoder:bool, fast_encoder:bool, color_fix:bool
         ):
-        
-        # for shorthand
-        vae = p.sd_model.first_stage_model
-        encoder = vae.encoder
-        decoder = vae.decoder
-
         # undo hijack if disabled (in cases last time crashed)
         if not enabled:
             try:
@@ -718,6 +712,12 @@ class Script(scripts.Script):
             except Exception:
                 pass
             if self.hooked:
+                if p.sd_model is None:
+                    self.hooked = False
+                    return
+                vae = p.sd_model.first_stage_model
+                encoder = vae.encoder
+                decoder = vae.decoder
                 if isinstance(encoder.forward, VAEHook):
                     encoder.forward.net = None
                     encoder.forward = encoder.original_forward
@@ -726,6 +726,15 @@ class Script(scripts.Script):
                     decoder.forward = decoder.original_forward
                 self.hooked = False
             return
+
+        if p.sd_model is None:
+            print("[Tiled VAE] skip: p.sd_model is None")
+            return
+
+        # for shorthand
+        vae = p.sd_model.first_stage_model
+        encoder = vae.encoder
+        decoder = vae.decoder
 
         if devices.get_optimal_device_name().startswith('cuda') and vae.device == devices.cpu and not vae_to_gpu:
             print("[Tiled VAE] warn: VAE is not on GPU, check 'Move VAE to GPU' if possible.")

@@ -261,7 +261,10 @@ class StableDiffusionProcessing:
 
     @property
     def sd_model(self):
-        return shared.sd_model
+        # Read model_data directly. Do not use dotted `shared.sd_model` here:
+        # on CPython 3.14 that path can specialize to module __dict__ None
+        # while model_data still holds the live checkpoint.
+        return sd_models.model_data.get_sd_model()
 
     @sd_model.setter
     def sd_model(self, value):
@@ -817,6 +820,98 @@ def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments=None, iter
     return f"{prompt_text}{negative_prompt_text}\n{generation_params_text}".strip()
 
 
+def ensure_sd_model_property(p=None):
+    """Keep StableDiffusionProcessing.sd_model as @property -> model_data.
+
+    Also strips subclass instance/class overrides of sd_model. Related: on
+    CPython 3.14, module-level `shared.sd_model = None` plus Shared's property
+    can make dotted `shared.sd_model` return None after the first hit; this
+    getter bypasses that path via model_data.get_sd_model().
+    """
+    base_attr = StableDiffusionProcessing.__dict__.get('sd_model')
+    if not isinstance(base_attr, property):
+        def _get(self):
+            return sd_models.model_data.get_sd_model()
+
+        def _set(self, value):
+            pass
+
+        StableDiffusionProcessing.sd_model = property(_get, _set)
+        print("[A1111] Reinstalled sd_model property on StableDiffusionProcessing", file=sys.stderr)
+
+    classes = []
+    if p is not None:
+        for cls in type(p).__mro__:
+            if cls is object:
+                break
+            if issubclass(cls, StableDiffusionProcessing):
+                classes.append(cls)
+    else:
+        classes = [StableDiffusionProcessing]
+        for name in ('StableDiffusionProcessingTxt2Img', 'StableDiffusionProcessingImg2Img'):
+            cls = globals().get(name)
+            if cls is not None:
+                classes.append(cls)
+
+    for cls in classes:
+        if cls is StableDiffusionProcessing:
+            continue
+        if 'sd_model' not in cls.__dict__:
+            continue
+        current = cls.__dict__['sd_model']
+        if isinstance(current, property):
+            continue
+        print(
+            f"[A1111] Removing broken {cls.__name__}.sd_model "
+            f"(was {type(current).__name__})",
+            file=sys.stderr,
+        )
+        delattr(cls, 'sd_model')
+
+    if p is not None and 'sd_model' in getattr(p, '__dict__', {}):
+        del p.__dict__['sd_model']
+        print("[A1111] Cleared instance __dict__['sd_model']", file=sys.stderr)
+
+
+def debug_sd_model_redirect(tag, p=None):
+    """Short property-integrity line (not full model repr).
+
+    Reads model_data under lock without get_sd_model() so a None pointer is not
+    silently reloaded mid-debug (which made RuntimeError report shared.sd_model=True).
+    """
+    base = StableDiffusionProcessing.__dict__.get('sd_model')
+    typ = type(p) if p is not None else None
+    if typ is not None and 'sd_model' in typ.__dict__:
+        cls_own = type(typ.__dict__['sd_model']).__name__
+    else:
+        cls_own = 'inherited'
+    in_inst = ('sd_model' in p.__dict__) if p is not None else False
+    raw = sd_models.peek_sd_model()
+    shared_m = raw
+    # If property redirect works, p.sd_model shares the same pointer as model_data.
+    # Only call the property when raw is live — calling it while raw is None triggers load.
+    if p is not None and raw is not None:
+        p_m = p.sd_model
+    elif p is not None:
+        p_m = None
+    else:
+        p_m = None
+    if p_m is None:
+        unet_state = "n/a"
+    elif hasattr(p_m, "unet"):
+        u = getattr(p_m, "unet", None)
+        unet_state = f"present:{type(u).__name__ if u is not None else 'None'}"
+    else:
+        unet_state = "absent"
+    print(
+        f"[DEBUG] {tag}: shared_ok={shared_m is not None} p_ok={p_m is not None} "
+        f"same={p_m is shared_m} base_is_prop={isinstance(base, property)} "
+        f"cls_own={cls_own} in_inst={in_inst} unet={unet_state} "
+        f"type={typ.__name__ if typ else None}",
+        file=sys.stderr,
+    )
+
+
 def process_images(p: StableDiffusionProcessing) -> Processed:
     if p.scripts is not None:
         p.scripts.before_process(p)
@@ -839,7 +934,13 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             if k == 'sd_vae':
                 sd_vae.reload_vae_weights()
 
-        sd_models.apply_token_merging(p.sd_model, p.get_token_merging_ratio())
+        # Wait out startup async load / recover sticky None before scripts touch p.sd_model
+        sd_model = sd_models.ensure_sd_model()
+        ensure_sd_model_property(p)
+        debug_sd_model_redirect("After ensure_sd_model", p)
+
+        # Pass the concrete model object; do not re-read p.sd_model for ToMe.
+        sd_models.apply_token_merging(sd_model, p.get_token_merging_ratio())
 
         # backwards compatibility, fix sampler and scheduler if invalid
         sd_samplers.fix_p_invalid_sampler_and_scheduler(p)
@@ -848,7 +949,13 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             res = process_images_inner(p)
 
     finally:
-        sd_models.apply_token_merging(p.sd_model, 0)
+        ensure_sd_model_property(p)
+        try:
+            sd_model = sd_models.ensure_sd_model()
+        except Exception:
+            sd_model = None
+        if sd_model is not None:
+            sd_models.apply_token_merging(sd_model, 0)
 
         # restore opts to original state
         if p.override_settings_restore_afterwards:
@@ -901,6 +1008,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         if p.refiner_checkpoint_info is None:
             raise Exception(f'Could not find checkpoint with name {p.refiner_checkpoint}')
 
+    sd_models.ensure_sd_model()
+
     if hasattr(shared.sd_model, 'fix_dimensions'):
         p.width, p.height = shared.sd_model.fix_dimensions(p.width, p.height)
 
@@ -908,9 +1017,11 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     p.sd_model_hash = shared.sd_model.sd_model_hash
     p.sd_vae_name = sd_vae.get_loaded_vae_name()
     p.sd_vae_hash = sd_vae.get_loaded_vae_hash()
+    debug_sd_model_redirect("After metadata from live model", p)
 
     modules.sd_hijack.model_hijack.apply_circular(p.tiling)
     modules.sd_hijack.model_hijack.clear_comments()
+    debug_sd_model_redirect("After apply_circular/clear_comments", p)
 
     p.fill_fields_from_opts()
     p.setup_prompts()
@@ -927,12 +1038,35 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
     if os.path.exists(cmd_opts.embeddings_dir) and not p.do_not_reload_embeddings:
         model_hijack.embedding_db.load_textual_inversion_embeddings()
+    debug_sd_model_redirect("After embeddings", p)
 
     if p.scripts is not None:
+        sd_models.ensure_sd_model()
+        ensure_sd_model_property(p)
+        debug_sd_model_redirect("Before scripts.process", p)
+        if sd_models.peek_sd_model() is None:
+            raise RuntimeError(
+                "sd_model is None before scripts.process; "
+                "refusing to run ControlNet/MultiDiffusion against a cleared model"
+            )
         p.scripts.process(p)
+        ensure_sd_model_property(p)
+        debug_sd_model_redirect("After scripts.process", p)
 
     infotexts = []
     output_images = []
+    ensure_sd_model_property(p)
+    debug_sd_model_redirect("Before ema_scope", p)
+    if p.sd_model is None:
+        sd_models.ensure_sd_model()
+        ensure_sd_model_property(p)
+        debug_sd_model_redirect("Before ema_scope (after recover)", p)
+    if sd_models.peek_sd_model() is None:
+        raise RuntimeError(
+            "sd_model is None before ema_scope "
+            f"(model_data.peek={sd_models.peek_sd_model() is not None}); "
+            "sd_model property redirect is broken"
+        )
     with torch.no_grad(), p.sd_model.ema_scope():
         with devices.autocast():
             p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
@@ -1456,7 +1590,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         with devices.autocast():
             self.calculate_hr_conds()
 
-        sd_models.apply_token_merging(self.sd_model, self.get_token_merging_ratio(for_hr=True))
+        hr_sd_model = sd_models.ensure_sd_model()
+        sd_models.apply_token_merging(hr_sd_model, self.get_token_merging_ratio(for_hr=True))
 
         if self.scripts is not None:
             self.scripts.before_hr(self)
@@ -1470,7 +1605,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         samples = self.sampler.sample_img2img(self, samples, noise, self.hr_c, self.hr_uc, steps=self.hr_second_pass_steps or self.steps, image_conditioning=image_conditioning)
 
-        sd_models.apply_token_merging(self.sd_model, self.get_token_merging_ratio())
+        hr_sd_model = sd_models.ensure_sd_model()
+        sd_models.apply_token_merging(hr_sd_model, self.get_token_merging_ratio())
 
         self.sampler = None
         devices.torch_gc()

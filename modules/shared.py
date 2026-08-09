@@ -44,7 +44,13 @@ options_templates: dict = None
 opts: options.Options = None
 restricted_opts: set[str] = None
 
-sd_model: sd_models_types.WebuiSdModel = None
+# Annotation only — do not bind None into this module's __dict__.
+# On CPython 3.14, if both Shared.sd_model (data descriptor) and
+# __dict__['sd_model']=None exist, specializing LOAD_ATTR can return the
+# dict None after the first successful property access (ControlNet /
+# MultiDiffusion then see p.sd_model is None while model_data stays live).
+# The Shared class (installed via shared_items) provides the real accessor.
+sd_model: sd_models_types.WebuiSdModel
 
 settings_components: dict = None
 """assigned from ui.py, a mapping on setting names to gradio components responsible for those settings"""
