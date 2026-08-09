@@ -1,5 +1,7 @@
 # Python 3.12 Compatibility (1.03, Windows / Linux / macOS)
 
+> **Current fork target (supersedes this document's Python 3.12 / older pin tables):** Python **3.14** only. Prefer root `README.md` and `modules/launch_utils.py` for FA2 / NumPy / SciPy / requirements selection. This file remains the **1.03-era** compatibility narrative.
+
 This fork of Stable Diffusion WebUI supports Python 3.12. Modifications in this document target Windows build-error avoidance and Linux / macOS startup-failure avoidance.
 
 This document reflects the repository state at `1.03` (commit `b5b1dd8` and later). For the full Linux / macOS fix design see [`LINUX_MAC_PY312_STARTUP_FIX.md`](LINUX_MAC_PY312_STARTUP_FIX.md). For the FA2 direct-load design see [`FA2_direct_load_design.md`](FA2_direct_load_design.md).

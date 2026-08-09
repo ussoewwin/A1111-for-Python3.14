@@ -42,12 +42,12 @@ Fully ported to Python 3.14. No `pkg_resources` hacks, no legacy compatibility l
 
 Direct Flash-Attention 2 support with staged fallback:
 ```
-1. FA-2 (Flash-Attention 2.9.1) — maximum speed
+1. FA-2 (Flash-Attention 2.8.4, torch 2.13.0+cu132) — maximum speed
 2. SDP (PyTorch scaled_dot_product_attention) — no extra deps
 3. sub_quad (built-in) — universal fallback
 ```
 
-Prebuilt Windows wheels included. Linux builds from source automatically. macOS skips FA2 (MPS limitation).
+Windows: prebuilt HF wheel (`2.8.4+cu132torch2.13.0` cp314). Linux: builds `flash-attn==2.8.4` from source against the same `torch==2.13.0+cu132` stack (CUDA toolkit 13.2 + `nvcc`). macOS skips FA2 (MPS limitation).
 
 
 ## Python Version Support
@@ -62,25 +62,26 @@ Other Python versions are not supported. Please ensure you are using Python 3.14
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| Windows  | Fully supported | Prebuilt wheels for FA2 / SciPy / NumPy; Insightface via pip |
-| Linux    | Supported | Flash-Attention 2 is built from source (requires CUDA toolkit + `nvcc`, ~30 min) |
-| macOS    | Supported (limited) | Flash-Attention 2 is skipped (CUDA required; MPS backend cannot use FA2) |
+| Windows  | Fully supported | PyTorch `2.13.0+cu132`; FA2 prebuilt `2.8.4+cu132torch2.13.0`; NumPy / SciPy from PyPI; Insightface via pip |
+| Linux    | Supported | Same PyTorch `2.13.0+cu132` / `torchvision==0.28.0+cu132`; FA2 source-builds `flash-attn==2.8.4` (CUDA toolkit **13.2** + `nvcc`, ~30 min) |
+| macOS    | Supported (limited) | PyTorch `2.13.0` CPU/MPS (`torchvision==0.28.0`); Flash-Attention 2 is skipped (CUDA required; MPS cannot use FA2) |
 
-All platform-specific handling is performed automatically by `modules/launch_utils.py` at startup. Windows install flow is byte-identical to the pre-1.03 behaviour; Linux / macOS branches are additive.
+All platform-specific handling is performed automatically by `modules/launch_utils.py` at startup. This fork supports **Python 3.14 only**. Linux / macOS branches are additive (FA2 path, venv `site-packages` layout for `clip.py` auto-fix).
 
 ## Default Package Versions
 
-The following packages are installed automatically during initial setup:
+The following packages are installed automatically during initial setup (see `modules/launch_utils.py`):
 
-- **PyTorch**: 2.11.0+cu130 (CUDA 13.0), with matching `torchvision==0.26.0+cu130` and `torchaudio==2.11.0+cu130`
+- **PyTorch** (suggested manual install): `2.13.0+cu132` with matching `torchvision==0.28.0+cu132` (override with `TORCH_COMMAND` / `TORCH_INDEX_URL` as needed; matches FA2 `cu132torch2.13.0`)
 - **Flash-Attention 2**:
-  - Windows: `2.8.3+cu130torch2.10.0` (prebuilt wheel)
-  - Linux: `flash-attn==2.8.3` (source build)
+  - Windows: `flash_attn` `2.8.4+cu132torch2.13.0` cp314 prebuilt wheel (HF)
+  - Linux: `flash-attn==2.8.4` (PyPI source build against `torch==2.13.0+cu132`; CUDA toolkit 13.2 + `nvcc`; `--no-build-isolation`)
   - macOS: skipped
-- **transformers**: 5.4.0+
+- **transformers**: 5.4.0
 - **protobuf**: 7.34.1
-- **scipy**: 1.16.1
-- **numpy**: 1.26.4
+- **scipy**: 1.16.1 (PyPI, all platforms)
+- **numpy**: 2.5.1 (PyPI, all platforms)
+- **Gradio**: 3.41.2 (HF wheel with METADATA pins removed)
 
 ## Installation
 
@@ -106,9 +107,9 @@ Pick the section for your OS and follow the steps in order.
    python -m pip install --upgrade pip
    ```
 
-4. Install PyTorch 2.11.0+cu130:
+4. Install PyTorch 2.13.0+cu132 (aligned with Flash-Attention 2):
    ```cmd
-   pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 torchaudio==2.11.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+   pip install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --index-url https://download.pytorch.org/whl/cu132
    ```
 
 5. Install cross-platform Python deps:
@@ -139,7 +140,7 @@ Pick the section for your OS and follow the steps in order.
 ### Linux
 
 **Toolchain prerequisites**
-- CUDA toolkit 13.0 with `nvcc` on `PATH` (required to build Flash-Attention 2 from source).
+- CUDA toolkit 13.2 with `nvcc` on `PATH` (required to build Flash-Attention 2 from source; matches `torch==2.13.0+cu132`).
 - Build toolchain (`gcc`, `g++`, `make`, Python headers).
 - First startup spends ~30 minutes building FA2. To use an alternate prebuilt wheel instead:
   ```bash
@@ -152,7 +153,7 @@ Pick the section for your OS and follow the steps in order.
 
 2. Create and activate a virtual environment:
    ```bash
-   python3.12 -m venv venv
+   python3.14 -m venv venv
    source venv/bin/activate
    ```
 
@@ -161,9 +162,9 @@ Pick the section for your OS and follow the steps in order.
    python -m pip install --upgrade pip
    ```
 
-4. Install PyTorch 2.11.0+cu130:
+4. Install PyTorch 2.13.0+cu132 (aligned with Flash-Attention 2):
    ```bash
-   pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 torchaudio==2.11.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+   pip install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --index-url https://download.pytorch.org/whl/cu132
    ```
 
 5. Install cross-platform Python deps:
@@ -186,7 +187,7 @@ Pick the section for your OS and follow the steps in order.
    pip install insightface
    ```
 
-9. Launch:
+9. Launch (`webui.sh` defaults to `python3.14`; override with `python_cmd` in `webui-user.sh` if needed):
    ```bash
    ./webui.sh
    ```
@@ -204,7 +205,7 @@ Pick the section for your OS and follow the steps in order.
 
 2. Create and activate a virtual environment:
    ```bash
-   python3.12 -m venv venv
+   python3.14 -m venv venv
    source venv/bin/activate
    ```
 
@@ -213,9 +214,9 @@ Pick the section for your OS and follow the steps in order.
    python -m pip install --upgrade pip
    ```
 
-4. Install PyTorch 2.11.0 (CPU / MPS):
+4. Install PyTorch 2.13.0 (CPU / MPS; version-aligned with the CUDA stack, FA2 skipped on macOS):
    ```bash
-   pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0
+   pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
    ```
 
 5. Install cross-platform Python deps:
@@ -244,12 +245,14 @@ Pick the section for your OS and follow the steps in order.
 
 `modules/launch_utils.py` branches by `platform.system()` at startup:
 
-- **Flash-Attention 2**: Windows wheel / Linux `--no-build-isolation` source build / macOS skip.
-- **SciPy**: Windows HuggingFace prebuilt wheel / Linux + macOS PyPI `scipy==1.16.1`.
-- **NumPy**: local Windows `whl/numpy-*.whl` is used when present (Windows only); otherwise NumPy is installed from PyPI at the pinned version.
-- **clip.py `pkg_resources` auto-fix**: targets `venv/Lib/...` on Windows and `venv/lib/pythonX.Y/...` on Linux / macOS (major / minor resolved dynamically).
+- **PyTorch default** (Windows / Linux CUDA): `torch==2.13.0+cu132` + `torchvision==0.28.0+cu132` via `TORCH_COMMAND` / `TORCH_INDEX_URL` (`https://download.pytorch.org/whl/cu132`). Same pin on first install for both platforms so Linux FA2 builds against the Windows FA2 stack.
+- **Requirements file**: Windows → `requirements_versions_py314_windows.txt`; Linux / macOS → `requirements_versions_py314.txt`.
+- **Flash-Attention 2**: Windows HF prebuilt `flash_attn-2.8.4+cu132torch2.13.0` cp314 / Linux PyPI `flash-attn==2.8.4` with `--no-build-isolation` (needs CUDA toolkit 13.2 + `nvcc`) / macOS skip.
+- **NumPy / SciPy**: all platforms install `numpy==2.5.1` and `scipy==1.16.1` from PyPI (no Windows-only wheel forced onto Linux).
+- **`clip.py` `pkg_resources` auto-fix**: `venv/Lib/...` on Windows; `venv/lib/pythonX.Y/...` on Linux / macOS (major / minor from the running interpreter).
+- **Python gate**: `check_python_version()` allows **3.14 only** (`webui.sh` default `python_cmd` is `python3.14`).
 
-See [`md/LINUX_MAC_PY312_STARTUP_FIX.md`](md/LINUX_MAC_PY312_STARTUP_FIX.md) for the full fix design and [`md/PYTHON312_COMPATIBILITY.md`](md/PYTHON312_COMPATIBILITY.md) for the overall Python 3.14 compatibility notes.
+Historical design notes (early Linux/Mac branching under the older 3.12 docs): [`md/LINUX_MAC_PY312_STARTUP_FIX.md`](md/LINUX_MAC_PY312_STARTUP_FIX.md), [`md/PYTHON312_COMPATIBILITY.md`](md/PYTHON312_COMPATIBILITY.md). Prefer this README and `launch_utils.py` for current pins.
 
 ## Changelog
 

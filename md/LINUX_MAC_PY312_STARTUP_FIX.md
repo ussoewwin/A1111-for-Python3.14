@@ -1,5 +1,7 @@
 # Linux / Mac Python 3.12 Startup Failure Fix
 
+> **Current fork target (supersedes this document's Python 3.12 wording):** Python **3.14** only. Runtime pins and OS branching live in `modules/launch_utils.py` and the root `README.md`. Today: FA2 Windows HF `2.8.4` cp314 / Linux `flash-attn==2.8.4`; `numpy==2.5.1` and `scipy==1.16.1` from PyPI on all platforms; `webui.sh` default `python_cmd=python3.14`. Keep the sections below as the **historical design record** of the original Linux/Mac branching work.
+
 ## 1. The Original Problem
 
 This repository targets Windows + Python 3.12 as its primary platform for the A1111 (AUTOMATIC1111 Stable Diffusion WebUI) fork. Its `PYTHON312_COMPATIBILITY.md` claims platform-aware support for Linux / Mac + Python 3.12 as well.

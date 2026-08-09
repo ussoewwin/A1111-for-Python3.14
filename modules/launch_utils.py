@@ -486,10 +486,12 @@ def requirements_met(requirements_file):
 
 
 def prepare_environment():
-    torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu130")
+    # Default CUDA stack matches Flash-Attention 2 Windows wheel (cu132 + torch 2.13.0).
+    # torchaudio is omitted: official cu132 index has no torchaudio wheels; A1111 image paths do not require it.
+    torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu132")
     torch_command = os.environ.get(
         'TORCH_COMMAND',
-        f"pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 torchaudio==2.11.0+cu130 --index-url {torch_index_url}",
+        f"pip install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --index-url {torch_index_url}",
     )
     if args.use_ipex:
         if platform.system() == "Windows":
@@ -522,9 +524,9 @@ def prepare_environment():
     # (evaluation.CLIPFeatureExtractor). WebUI sampling does not import that path;
     # repositories/k-diffusion was patched so package import no longer pulls it in.
     openclip_package = os.environ.get('OPENCLIP_PACKAGE', "https://github.com/mlfoundations/open_clip/archive/bb6e834e9c70d9c27d0dc3ecedeebeaeb1ffad6b.zip")
-    # Flash-Attention 2 source is platform-specific:
-    #   Windows: prebuilt wheel (cu132 + torch 2.13, cp314)
-    #   Linux:   source build via PyPI (requires CUDA toolkit + nvcc, ~30min compile)
+    # Flash-Attention 2 source is platform-specific (same torch 2.13.0+cu132 baseline on Win/Linux):
+    #   Windows: prebuilt wheel (cu132 + torch 2.13.0, cp314)
+    #   Linux:   source build via PyPI flash-attn==2.8.4 (CUDA toolkit 13.2 + nvcc, ~30min compile)
     #   Mac:     skipped (FA2 requires CUDA; MPS backend cannot use it)
     if platform.system() == "Windows":
         flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/flash_attn-2.8.4%2Bcu132torch2.13.0cxx11abiTRUE-cp314-cp314-win_amd64.whl')

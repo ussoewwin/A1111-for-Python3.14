@@ -41,10 +41,10 @@ then
     clone_dir="stable-diffusion-webui"
 fi
 
-# python3 executable
+# python3 executable (this fork requires Python 3.14)
 if [[ -z "${python_cmd}" ]]
 then
-  python_cmd="python3.10"
+  python_cmd="python3.14"
 fi
 if [[ ! -x "$(command -v "${python_cmd}")" ]]
 then
