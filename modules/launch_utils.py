@@ -139,36 +139,73 @@ def run_pip(command, desc=None, live=default_command_live):
     return run(f'"{python}" -m pip {command} --prefer-binary{only_binary_flag}{index_url_line}', desc=f"Installing {desc}", errdesc=f"Couldn't install {desc}", live=live)
 
 
-def _torch_stack_constraint_file() -> str | None:
-    """
-    Pin only installed torch (exact local version, e.g. 2.13.0+cu132).
-    Prevents later pip -r / extension install.py from replacing CUDA builds with PyPI CPU wheels.
-    """
-    import importlib.metadata
-
-    try:
-        ver = importlib.metadata.version("torch")
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-    path = os.path.join(script_path, "tmp", "torch_stack_constraints.txt")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"torch=={ver}\n")
-    return path
-
-
-def _apply_torch_stack_pip_constraint() -> None:
-    path = _torch_stack_constraint_file()
-    if path is None:
-        return
-    os.environ["PIP_CONSTRAINT"] = path
-    print(f"Torch pinned ({path}); pip will not replace torch")
-
-
 def check_run_python(code: str) -> bool:
     result = subprocess.run([python, "-c", code], capture_output=True, shell=False)
     return result.returncode == 0
+
+
+def _torch_stack_versions(*, cuda_required: bool) -> tuple[str, str] | None:
+    """
+    Return (torch.__version__, torchvision.__version__) from the live interpreter.
+
+    Do NOT use importlib.metadata.version("torch"): it strips local tags (+cu132) and
+    writes torch==2.13.0, which pip can satisfy with a PyPI CPU wheel on CUDA platforms.
+    """
+    if cuda_required:
+        code = (
+            "import torch, torchvision; "
+            "assert torch.version.cuda is not None; "
+            "assert '+cpu' not in torch.__version__.lower(); "
+            "print(torch.__version__); print(torchvision.__version__)"
+        )
+    else:
+        # Darwin / IPEX: CPU (or XPU) wheels are intentional; pin whatever is installed.
+        code = "import torch, torchvision; print(torch.__version__); print(torchvision.__version__)"
+    result = subprocess.run([python, "-c", code], capture_output=True, shell=False, text=True)
+    if result.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    torch_ver, tv_ver = lines[0], lines[1]
+    if cuda_required and ("+" not in torch_ver or "+cpu" in torch_ver.lower()):
+        # Bare 2.13.0 on a CUDA host is the CPU-swap footgun — refuse to pin it.
+        return None
+    return torch_ver, tv_ver
+
+
+def _torch_stack_constraint_file(*, cuda_required: bool) -> str | None:
+    versions = _torch_stack_versions(cuda_required=cuda_required)
+    if versions is None:
+        return None
+    torch_ver, tv_ver = versions
+    path = os.path.join(script_path, "tmp", "torch_stack_constraints.txt")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"torch=={torch_ver}\n")
+        f.write(f"torchvision=={tv_ver}\n")
+    return path
+
+
+def _apply_torch_stack_pip_constraint(
+    torch_index_url: str | None = None,
+    *,
+    cuda_required: bool = True,
+) -> None:
+    path = _torch_stack_constraint_file(cuda_required=cuda_required)
+    if path is None:
+        return
+    os.environ["PIP_CONSTRAINT"] = path
+    default_index = (
+        "https://download.pytorch.org/whl/cu132"
+        if cuda_required
+        else "https://download.pytorch.org/whl/cpu"
+    )
+    index = torch_index_url or os.environ.get("TORCH_INDEX_URL", default_index)
+    extra = os.environ.get("PIP_EXTRA_INDEX_URL", "").strip()
+    if index and index not in extra.split():
+        os.environ["PIP_EXTRA_INDEX_URL"] = f"{extra} {index}".strip() if extra else index
+    print(f"Torch pinned ({path}); pip will not replace torch")
 
 
 def git_fix_workspace(dir, name):
@@ -486,13 +523,23 @@ def requirements_met(requirements_file):
 
 
 def prepare_environment():
-    # Default CUDA stack matches Flash-Attention 2 Windows wheel (cu132 + torch 2.13.0).
+    # Platform defaults (overridable via TORCH_COMMAND / TORCH_INDEX_URL / webui-macos-env.sh):
+    #   Windows / Linux CUDA: torch 2.13.0+cu132 + torchvision 0.28.0+cu132 (FA2 cu132 stack)
+    #   Darwin (macOS):       torch 2.13.0 + torchvision 0.28.0 from cpu index (MPS; FA2 skipped)
     # torchaudio is omitted: official cu132 index has no torchaudio wheels; A1111 image paths do not require it.
-    torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu132")
-    torch_command = os.environ.get(
-        'TORCH_COMMAND',
-        f"pip install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --index-url {torch_index_url}",
-    )
+    is_darwin = platform.system() == "Darwin"
+    if is_darwin:
+        torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cpu")
+        torch_command = os.environ.get(
+            'TORCH_COMMAND',
+            f"pip install torch==2.13.0 torchvision==0.28.0 --index-url {torch_index_url}",
+        )
+    else:
+        torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu132")
+        torch_command = os.environ.get(
+            'TORCH_COMMAND',
+            f"pip install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --index-url {torch_index_url}",
+        )
     if args.use_ipex:
         if platform.system() == "Windows":
             # The "Nuullll/intel-extension-for-pytorch" wheels were built from IPEX source for Intel Arc GPU: https://github.com/intel/intel-extension-for-pytorch/tree/xpu-main
@@ -625,20 +672,21 @@ def prepare_environment():
     except Exception as e:
         print(f"Warning: Failed to copy xformers_fix files: {e}")
 
-    # PyTorch installation removed - install manually if needed
-
-    # Check if torch is installed, but don't install it automatically
+    # First install: platform TORCH_COMMAND (CUDA on Win/Linux; CPU/MPS wheels on Darwin).
     if not is_installed("torch") or not is_installed("torchvision"):
-        print("Warning: PyTorch is not installed. Please install it manually before running the web UI.")
-        print(f"Suggested command: {torch_command}")
+        run(f'"{python}" -m {torch_command}', "Installing torch and torchvision", "Couldn't install torch", live=True)
+        startup_timer.record("install torch")
 
-    # Pin installed CUDA torch before requirements / extension installers can pull PyPI CPU torch.
+    # Pin installed torch before requirements / extension installers can replace the stack.
+    # CUDA hosts: pin full local tags (+cu132) so pip cannot swap to PyPI CPU.
+    # Darwin / IPEX: pin installed versions without requiring CUDA.
+    cuda_torch_required = not is_darwin and not args.use_ipex
     if is_installed("torch"):
-        _apply_torch_stack_pip_constraint()
+        _apply_torch_stack_pip_constraint(torch_index_url, cuda_required=cuda_torch_required)
 
-    # Only test CUDA if torch is installed
     if is_installed("torch"):
-        if args.use_ipex:
+        # macOS uses MPS (or CPU); CUDA check does not apply. Same for IPEX.
+        if args.use_ipex or is_darwin:
             args.skip_torch_cuda_test = True
         if not args.skip_torch_cuda_test and not check_run_python("import torch; assert torch.cuda.is_available()"):
             raise RuntimeError(
