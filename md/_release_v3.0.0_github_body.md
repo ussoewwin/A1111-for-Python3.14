@@ -122,7 +122,7 @@ Part of the 3.14 defaults commit (`8588e0ca`):
 - Startup installs **`numpy==2.5.1`** from PyPI on **all platforms** (`modules/launch_utils.py`), then pins again after extension installers so drift cannot stick.
 - Requirements: `requirements_versions_py314.txt` / `requirements_versions_py314_windows.txt` pin `numpy==2.5.1`.
 - **SciPy** is `scipy==1.16.1` from PyPI, aligned to that NumPy pin (no Windows-only HF scipy wheel forced onto Linux).
-- Interim tracked `whl/numpy-1.26.4-cp314-…` work (commit `15d8a90b`) is **not** the v3.0.0 install path; runtime does **not** install NumPy from that local wheel.
+- Interim `whl/numpy-1.26.4-cp314-…` work (commit `15d8a90b`) was **never** the v3.0.0 install path; runtime installs NumPy from PyPI only. That interim wheel is removed from the tree so docs cannot point at a local 1.26.4 artifact as current.
 
 ---
 

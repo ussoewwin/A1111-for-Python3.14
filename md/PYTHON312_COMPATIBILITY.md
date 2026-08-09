@@ -1,6 +1,6 @@
 # Python 3.12 Compatibility (1.03, Windows / Linux / macOS)
 
-> **Current fork target (supersedes this document's Python 3.12 / older pin tables):** Python **3.14** only. Prefer root `README.md` and `modules/launch_utils.py` for FA2 / NumPy / SciPy / requirements selection. This file remains the **1.03-era** compatibility narrative.
+> **Current fork target (supersedes this document's Python 3.12 / older pin tables):** Python **3.14** only. Prefer root `README.md` and `modules/launch_utils.py` for FA2 / NumPy / SciPy / requirements selection. Live pins: **`numpy==2.5.1`** and **`scipy==1.16.1` from PyPI** on all platforms. This file remains the **1.03-era** compatibility narrative; any `numpy==1.26.4` / Windows HF SciPy wording below is historical, not current.
 
 This fork of Stable Diffusion WebUI supports Python 3.12. Modifications in this document target Windows build-error avoidance and Linux / macOS startup-failure avoidance.
 
@@ -30,7 +30,8 @@ Both files are currently byte-identical (shared baseline). Platform-specific beh
 ### 3. scikit-image build avoidance (Windows)
 - `requirements_versions_py314_windows.txt` pins `scikit-image>=0.22.0`.
 - A version with a prebuilt wheel is used so that a Visual Studio C/C++ toolchain is not required.
-- Aligned with `numpy==1.26.4` so the dtype layout matches the scipy wheel described below.
+- **(Historical, 1.03-era)** Aligned with `numpy==1.26.4` so the dtype layout matched the SciPy wheel described below.
+- **Current:** `numpy==2.5.1` from PyPI (all platforms); see README / `launch_utils.py`.
 
 ### 4. torch / CUDA stack
 **File**: `modules/launch_utils.py`
@@ -55,14 +56,16 @@ Override with the `FLASH_ATTN_PACKAGE` environment variable. For rationale see [
 ### 6. SciPy — per-platform install
 **File**: `modules/launch_utils.py`
 
-scipy is sourced differently per OS to keep the dtype layout aligned with `numpy==1.26.4`:
+**(Historical, 1.03-era)** SciPy was sourced differently per OS to keep the dtype layout aligned with `numpy==1.26.4`:
 
-| Environment | Install source |
+| Environment | Install source (historical) |
 |-------------|----------------|
 | Windows | HuggingFace `ussoewwin/scipy-1.16.1-cp312-cp312-win_amd64` wheel, forced via `--no-deps --no-index` |
 | Linux / macOS | PyPI `scipy==1.16.1` (manylinux / macosx wheel) |
 
-Override (Windows only) with the `SCIPY_WHEEL` environment variable.
+Override (Windows only, historical) with the `SCIPY_WHEEL` environment variable.
+
+**(Current):** all platforms install `scipy==1.16.1` from PyPI after `numpy==2.5.1` (no HF SciPy URL).
 
 ### 7. clip.py auto-fix path branching
 **File**: `modules/launch_utils.py` (`fix_clip_packaging_import()`)
