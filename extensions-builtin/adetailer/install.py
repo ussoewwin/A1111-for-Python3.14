@@ -211,7 +211,7 @@ def install():
         print(
             "[!] ADetailer: onnxruntime import failed; "
             "first-install should provide onnxruntime-gpu via launch_utils "
-            "(Windows: ort-cuda-13-nightly)."
+            "(PyPI onnxruntime-gpu on Windows / Linux)."
         )
     
     # Download YOLOv8 models after installing dependencies

@@ -25,7 +25,7 @@ Repository: https://github.com/ussoewwin/A1111-for-Python3.14
 | Flash-Attention 2 | **2.8.4** aligned to torch 2.13.0+cu132 |
 | CUDA toolkit (Linux FA2 source build) | **13.2** + `nvcc` |
 | NumPy / SciPy | `numpy==2.4.6` and `scipy==1.16.1` from **PyPI** (all platforms); `facexlib==0.3.0` enabled |
-| ONNX Runtime | Windows: `onnxruntime-gpu` from **ort-cuda-13-nightly** on first launch; Linux: PyPI `onnxruntime-gpu`; macOS: `onnxruntime` |
+| ONNX Runtime | Windows / Linux: PyPI `onnxruntime-gpu` on first launch; macOS: `onnxruntime` |
 | Requirements files | Renamed to `requirements_versions_py314*.txt` |
 | Critical runtime fix | CPython 3.14 `shared.sd_model` LOAD_ATTR / `None` shadow |
 
@@ -128,10 +128,8 @@ Part of the 3.14 defaults commit (`8588e0ca`):
 
 ## 6b. ONNX Runtime (InsightFace / ReActor / ADetailer)
 
-- On **Windows**, first launch runs:
-  `pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu`
-  via `modules/launch_utils.py` (before extension installers), so InsightFace and ReActor do not fail with `No module named 'onnxruntime'`.
-- Linux installs PyPI `onnxruntime-gpu`; macOS installs `onnxruntime`.
+- On **Windows / Linux**, first launch runs `pip install onnxruntime-gpu` (PyPI) via `modules/launch_utils.py` (before extension installers), so InsightFace and ReActor do not fail with `No module named 'onnxruntime'`.
+- macOS installs `onnxruntime`.
 - ADetailer no longer force-installs the CPU `onnxruntime` package name (which conflicts with the `onnxruntime-gpu` distribution).
 
 ---
@@ -176,7 +174,7 @@ Earlier v2.3.x work (RES4LYF, Forge tiled VAE, ControlNet bf16, LoRA logging, et
 1. Fresh **Python 3.14** venv; confirm startup does not reject the interpreter.
 2. Confirm installed torch prints `2.13.0+cu132` (or your override) and matching torchvision.
 3. Confirm `numpy==2.4.6` (and `scipy==1.16.1`, `facexlib==0.3.0`) from PyPI — not a local `whl/numpy-1.26.4` install.
-4. Confirm `import onnxruntime` works (Windows: `onnxruntime-gpu` from ort-cuda-13-nightly).
+4. Confirm `import onnxruntime` works (Windows / Linux: PyPI `onnxruntime-gpu`).
 4. Windows: FA2 wheel installs; Linux: FA2 source build completes with toolkit 13.2.
 5. Load SD1.5 / SDXL, run txt2img with ControlNet and/or MultiDiffusion if you use them — confirm no intermittent `sd_model is None`.
 6. Switch checkpoints / VAE mid-session without LoRA / VAE `NoneType` crashes.

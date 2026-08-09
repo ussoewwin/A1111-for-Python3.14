@@ -128,9 +128,9 @@ Pick the section for your OS and follow the steps in order.
    pip install triton-windows
    ```
 
-7. ONNX Runtime GPU is installed automatically on first launch (`modules/launch_utils.py`) from the Windows CUDA 13 nightly feed:
+7. ONNX Runtime GPU is installed automatically on first launch (`modules/launch_utils.py`) from PyPI:
    ```cmd
-   pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu
+   pip install onnxruntime-gpu
    ```
    Manual install of the same command is only needed if you used `--skip-install`.
 
@@ -257,7 +257,7 @@ Pick the section for your OS and follow the steps in order.
 - **Requirements file**: Windows → `requirements_versions_py314_windows.txt`; Linux / macOS → `requirements_versions_py314.txt`.
 - **Flash-Attention 2**: Windows HF prebuilt `flash_attn-2.8.4+cu132torch2.13.0` cp314 / Linux PyPI `flash-attn==2.8.4` with `--no-build-isolation` (needs CUDA toolkit 13.2 + `nvcc`) / macOS skip.
 - **NumPy / SciPy**: all platforms install `numpy==2.4.6` and `scipy==1.16.1` from PyPI (no Windows-only wheel forced onto Linux). NumPy is pinned to 2.4.6 so numba/facexlib work on first install.
-- **ONNX Runtime**: Windows first launch installs `onnxruntime-gpu` from `ort-cuda-13-nightly` (InsightFace / ReActor / ADetailer). Linux uses PyPI `onnxruntime-gpu`; macOS uses `onnxruntime`.
+- **ONNX Runtime**: Windows / Linux first launch installs PyPI `onnxruntime-gpu` (InsightFace / ReActor / ADetailer). macOS uses `onnxruntime`.
 - **`clip.py` `pkg_resources` auto-fix**: `venv/Lib/...` on Windows; `venv/lib/pythonX.Y/...` on Linux / macOS (major / minor from the running interpreter).
 - **Python gate**: `check_python_version()` allows **3.14 only** (`webui.sh` default `python_cmd` is `python3.14`).
 

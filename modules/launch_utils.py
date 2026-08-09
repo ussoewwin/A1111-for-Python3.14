@@ -752,24 +752,14 @@ def prepare_environment():
     print("[INFO] Installed scipy 1.16.1 from PyPI")
 
     # ONNX Runtime before extension installers (InsightFace / ReActor / ADetailer / WD14).
-    # Windows CUDA 13: ort-cuda-13-nightly onnxruntime-gpu (README). Dist name may be
-    # onnxruntime-gpu while import remains onnxruntime — check import, not dist name.
+    # Dist name may be onnxruntime-gpu while import remains onnxruntime — check import.
     if not check_run_python("import onnxruntime"):
-        if platform.system() == "Windows":
-            ort_index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/"
-            run(
-                f'"{python}" -m pip install --pre --index-url {ort_index} onnxruntime-gpu',
-                "Installing onnxruntime-gpu (CUDA 13 nightly)",
-                "Couldn't install onnxruntime-gpu",
-                live=True,
-            )
-            print("[INFO] Installed onnxruntime-gpu from ort-cuda-13-nightly")
-        elif platform.system() == "Darwin":
+        if platform.system() == "Darwin":
             run_pip("install onnxruntime", "onnxruntime")
             print("[INFO] Installed onnxruntime (macOS)")
         else:
             run_pip("install onnxruntime-gpu", "onnxruntime-gpu")
-            print("[INFO] Installed onnxruntime-gpu")
+            print("[INFO] Installed onnxruntime-gpu from PyPI")
         startup_timer.record("install onnxruntime")
     
     # Auto-fix clip.py packaging import (AFTER requirements installation)
