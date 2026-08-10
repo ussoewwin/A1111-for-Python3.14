@@ -1,11 +1,12 @@
 """
-SDXL INT8 ConvRot support for A1111 (完全隔離型).
+SDXL INT8 ConvRot + NVFP4 ConvRot support for A1111 (完全隔離型).
 
 チェックポイントが comfy_quant + convrot マーカーを含む場合のみ動作。
 int8 weight + weight_scale を float16 に逆量子化し、
 ConvRot の Hadamard 回転を元に戻してから通常ロードパスに渡す。
+NVFP4 (E2M1 packed) weight も comfy_kitchen で逆量子化する。
 
-SDXL 以外、INT8 以外、ConvRot 以外のモデルには一切影響しない。
+SDXL 以外、INT8/NVFP4 以外、ConvRot 以外のモデルには一切影響しない。
 approach: offline dequantize + unrotate at load time → standard float model
 """
 
@@ -22,7 +23,6 @@ logger = logging.getLogger(__name__)
 _HADAMARD_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
 
 _LOG = "[INT8 ConvRot]"
-
 
 # ---------------------------------------------------------------------------
 # Hadamard matrix (same as native_convert_int8.py / comfy_kitchen)
@@ -133,7 +133,7 @@ def state_dict_has_comfy_quant(state_dict: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Core: in-place dequantize + unrotate
+# INT8 dequantize + unrotate
 # ---------------------------------------------------------------------------
 
 def dequantize_int8_state_dict(
@@ -241,3 +241,162 @@ def dequantize_int8_state_dict(
             state_dict.pop(k, None)
 
     return stats
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 dequantize + unrotate
+# ---------------------------------------------------------------------------
+
+def _dequantize_nvfp4_layer(
+    state_dict: dict,
+    prefix: str,
+    conf: dict,
+    target_dtype: torch.dtype,
+) -> str:
+    """Dequantize a single NVFP4 Linear layer in-place.
+
+    Returns "nvfp4_plain" or "nvfp4_convrot" on success, "skipped" on failure.
+    """
+    weight_key = prefix + ".weight"
+    scale_key = prefix + ".weight_scale"        # block scales (float8_e4m3fn)
+    scale_2_key = prefix + ".weight_scale_2"    # per-tensor scale (float32)
+    input_scale_key = prefix + ".input_scale"
+    pre_quant_scale_key = prefix + ".pre_quant_scale"
+
+    weight = state_dict.get(weight_key)
+    block_scale = state_dict.get(scale_key)
+    tensor_scale = state_dict.get(scale_2_key)
+
+    if weight is None or block_scale is None or tensor_scale is None:
+        return "skipped"
+
+    # Import comfy_kitchen for dequantize_nvfp4
+    try:
+        import comfy_kitchen as ck
+    except ImportError:
+        print(f"[NVFP4] ERROR: comfy_kitchen not available, cannot dequantize {prefix}")
+        return "skipped"
+
+    # Dequantize: packed uint8 → float (padded shape)
+    # ck.dequantize_nvfp4(qx, per_tensor_scale, block_scales, output_type, hi_first)
+    # hi_first defaults to True (matches nvfp4_conf.py / ck default)
+    hi_first = conf.get("hi_first", True)
+    output_type = torch.float32  # dequantize in fp32 for accuracy, convert later
+
+    w_float = ck.dequantize_nvfp4(
+        weight,
+        tensor_scale.float(),
+        block_scale,
+        output_type=output_type,
+        hi_first=hi_first,
+    )
+
+    # Crop from padded shape to logical orig_shape
+    orig_shape = conf.get("orig_shape")
+    if orig_shape and len(orig_shape) >= 2:
+        out_f = int(orig_shape[0])
+        in_f = int(orig_shape[1])
+        if w_float.shape[0] > out_f or w_float.shape[1] > in_f:
+            w_float = w_float[:out_f, :in_f]
+    elif hasattr(w_float, "shape") and w_float.ndim == 2:
+        # No orig_shape in conf — try in_features / out_features
+        out_f = conf.get("out_features")
+        in_f = conf.get("in_features")
+        if out_f and in_f:
+            w_float = w_float[:int(out_f), :int(in_f)]
+
+    # ConvRot unrotate
+    is_convrot = conf.get("convrot", False)
+    group_size = conf.get("convrot_groupsize", 256)
+
+    if is_convrot and w_float.ndim == 2:
+        gs = _valid_group_size(w_float.shape[1], group_size)
+        if gs is not None:
+            H = build_hadamard(gs, device=w_float.device, dtype=torch.float32)
+            w_float = unrotate_weight(w_float, H, gs)
+            result = "nvfp4_convrot"
+        else:
+            result = "nvfp4_plain"
+    else:
+        result = "nvfp4_plain"
+
+    # Store dequantized weight
+    state_dict[weight_key] = w_float.to(target_dtype)
+
+    # Remove all NVFP4 sidecar keys
+    for k in [scale_key, scale_2_key, input_scale_key, pre_quant_scale_key,
+              prefix + ".comfy_quant"]:
+        state_dict.pop(k, None)
+
+    return result
+
+
+def dequantize_nvfp4_state_dict(
+    state_dict: dict,
+    target_dtype: torch.dtype = torch.float16,
+) -> dict:
+    """In-place: convert all NVFP4 (format=nvfp4) weights to float.
+
+    Only processes layers where comfy_quant format == "nvfp4".
+    INT8 layers in the same mixed-pack checkpoint are left for
+    dequantize_int8_state_dict to handle.
+
+    Returns dict with stats for logging.
+    """
+    stats = {
+        "nvfp4_plain": 0,
+        "nvfp4_convrot": 0,
+        "skipped": 0,
+    }
+
+    cq_keys = [k for k in list(state_dict.keys()) if k.endswith(".comfy_quant")]
+    if not cq_keys:
+        return stats
+
+    for cq_key in cq_keys:
+        prefix = cq_key[: -len(".comfy_quant")]
+
+        # Skip if comfy_quant already popped by int8 pass
+        if cq_key not in state_dict:
+            continue
+
+        try:
+            raw_conf = decode_comfy_quant_conf(state_dict[cq_key])
+            conf = _get_layer_conf(raw_conf, prefix)
+        except Exception:
+            continue
+
+        fmt = conf.get("format", "")
+        if fmt != "nvfp4":
+            continue  # Not NVFP4, leave for int8 or skip
+
+        result = _dequantize_nvfp4_layer(state_dict, prefix, conf, target_dtype)
+        stats[result] = stats.get(result, 0) + 1
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Combined entry point (called from sd_models.py)
+# ---------------------------------------------------------------------------
+
+def dequantize_state_dict(
+    state_dict: dict,
+    target_dtype: torch.dtype = torch.float16,
+) -> dict:
+    """Combined dequantize: NVFP4 first, then INT8.
+
+    NVFP4 Linear layers and INT8 Conv2d layers can coexist in the same
+    checkpoint (mixed pack). Process NVFP4 first (it reads .comfy_quant),
+    then INT8 (which also reads .comfy_quant — keys already popped by NVFP4
+    are skipped automatically).
+
+    Returns combined stats dict for logging.
+    """
+    # NVFP4 pass (Linear layers with format=nvfp4)
+    nvfp4_stats = dequantize_nvfp4_state_dict(state_dict, target_dtype)
+
+    # INT8 pass (Conv2d layers with format=int8_tensorwise, and any remaining int8)
+    int8_stats = dequantize_int8_state_dict(state_dict, target_dtype)
+
+    return {**nvfp4_stats, **int8_stats}

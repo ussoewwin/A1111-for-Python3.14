@@ -434,19 +434,24 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
     if model.is_ssd:
         sd_hijack.model_hijack.convert_sdxl_to_ssd(model)
 
-    # --- SDXL INT8 ConvRot: dequantize before cache + load_state_dict (完全隔離) ---
+    # --- SDXL INT8/NVFP4 ConvRot: dequantize before cache + load_state_dict (完全隔離) ---
     try:
         from modules import sdxl_int8_convrot as _int8cr
         if _int8cr.state_dict_has_comfy_quant(state_dict):
             _target_dt = torch.float32 if shared.cmd_opts.no_half else torch.float16
-            _stats = _int8cr.dequantize_int8_state_dict(state_dict, target_dtype=_target_dt)
-            print(f"{_int8cr._LOG} Dequantized state_dict: "
-                  f"plain={_stats['plain']} convrot_linear={_stats['convrot_linear']} "
-                  f"convrot_conv2d={_stats['convrot_conv2d']} skipped={_stats['skipped']} "
-                  f"already_float={_stats['already_float']}")
-            timer.record("INT8 ConvRot dequantize")
+            _stats = _int8cr.dequantize_state_dict(state_dict, target_dtype=_target_dt)
+            print(f"[ConvRot] Dequantized state_dict: "
+                  f"int8_plain={_stats.get('plain', 0)} "
+                  f"int8_convrot_linear={_stats.get('convrot_linear', 0)} "
+                  f"int8_convrot_conv2d={_stats.get('convrot_conv2d', 0)} "
+                  f"int8_skipped={_stats.get('skipped', 0)} "
+                  f"int8_already_float={_stats.get('already_float', 0)} "
+                  f"nvfp4_plain={_stats.get('nvfp4_plain', 0)} "
+                  f"nvfp4_convrot={_stats.get('nvfp4_convrot', 0)} "
+                  f"nvfp4_skipped={_stats.get('nvfp4_skipped', 0)}")
+            timer.record("ConvRot dequantize")
     except Exception as _e:
-        print(f"[INT8 ConvRot] WARNING: dequantize hook failed: {_e}")
+        print(f"[ConvRot] WARNING: dequantize hook failed: {_e}")
 
     if shared.opts.sd_checkpoint_cache > 0:
         # cache newly loaded model (after dequantize, so cache has float weights)
