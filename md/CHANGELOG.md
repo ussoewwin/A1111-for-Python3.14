@@ -1,8 +1,23 @@
-# Release Notes (v1.01 to v3.0.0)
+# Release Notes (v1.01 to v3.0.1)
 
-This document contains release notes for versions v1.01 through v3.0.0. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.0.1. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
 
 ---
+
+## v3.0.1
+
+### Added: SDXL ConvRot INT8 / NVFP4 Checkpoint Support
+
+- **Added**: **SDXL ConvRot INT8 checkpoint loading** ? `modules/sdxl_int8_convrot.py` (new) plus a fully isolated hook in `modules/sd_models.py`. Checkpoints quantized with the ComfyUI-native `comfy_quant` format (`int8_tensorwise`, optional `convrot:true`) are detected via `.comfy_quant` keys and **offline-dequantized + Hadamard-unrotated at load time**, then flow through the standard A1111 float16 pipeline (`96a80ed7`). Plain INT8 (scalar scale), ConvRot Linear (`W_rot = W @ H^T`, row-wise `[out,1]` scale) and ConvRot Conv2d (in_channels rotation, channel-wise `[out,1,1,1]` scale) are all supported.
+- **Added**: **SDXL ConvRot NVFP4 checkpoint loading** ? NVFP4 (E2M1 packed) Linear layers in mixed-pack checkpoints are dequantized via `comfy_kitchen.dequantize_nvfp4` (padded->logical crop via `orig_shape`), with ConvRot Hadamard unrotate; Conv2d layers in the same checkpoint use the INT8 path (`27891d83`).
+- **Fixed**: Combined stats dict `skipped` key collision between the NVFP4 and INT8 passes (NVFP4 counter renamed to `nvfp4_skipped`) (`181e3783`).
+- **Docs**: Full technical documentation for the INT8/NVFP4 ConvRot implementation in `docs/SDXL_ConvRot_INT8_NVFP4_Technical_Documentation.md` (`07fa0b3f`).
+- **Isolation guarantee**: the dequantize hook is a strict no-op for any checkpoint without `.comfy_quant` keys; no monkey-patches, no custom layer injection, no forward-path changes. Non-quantized SD1.5/SD2/SDXL/fp16/fp8 checkpoints are completely unaffected.
+- **Summary**: SDXL ConvRot INT8 + NVFP4 (mixed-pack) checkpoint support via offline dequantize/unrotate at load time, with complete isolation from all other model formats.
+- **Release Note**: [v3.0.1 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.1)
+
+---
+
 
 ## v3.0.0
 
