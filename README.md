@@ -3,18 +3,6 @@
 A web interface for Stable Diffusion, implemented using the Gradio library.
 ## Key Features & Improvements
 
-## 🎉 v3.0.1 - SDXL ConvRot INT8 / NVFP4 Checkpoint Support
-
-**Load quantized SDXL checkpoints directly in A1111** — offline dequantize + Hadamard unrotate at load time, fully isolated from all other model formats.
-
-- **ConvRot INT8** (`int8_tensorwise` + `convrot:true`): plain / ConvRot Linear / ConvRot Conv2d scale layouts
-- **ConvRot NVFP4** (E2M1 packed): mixed-pack checkpoints (Linear = NVFP4, Conv2d = INT8)
-- Strict no-op for checkpoints without `.comfy_quant` keys — SD1.5 / SD2 / SDXL / fp16 / fp8 are completely unaffected
-
-> **Supported checkpoints:** only models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).
-
-For detailed technical explanation, see [v3.0.1 Release Notes](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.1)
-
 ## 🎉 MAJOR UPDATE: v3.0.0 - Python 3.14 Full Renewal!
 
 **This repository is Python 3.14–only** (`ussoewwin/A1111-for-Python3.14`). Default first-install CUDA stack: `torch==2.13.0+cu132` + `torchvision==0.28.0+cu132`, Flash-Attention 2 **2.8.4**, plus the CPython 3.14 `shared.sd_model` LOAD_ATTR fix.
@@ -67,6 +55,17 @@ Direct Flash-Attention 2 support with staged fallback:
 
 Windows: prebuilt HF wheel (`2.8.4+cu132torch2.13.0` cp314). Linux: builds `flash-attn==2.8.4` from source against the same `torch==2.13.0+cu132` stack (CUDA toolkit 13.2 + `nvcc`). macOS skips FA2 (MPS limitation).
 
+
+### SDXL ConvRot INT8 / NVFP4 Checkpoints (v3.0.1+)
+
+Load SDXL checkpoints quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization) directly in A1111. Weights are offline-dequantized and Hadamard-unrotated at load time, fully isolated from all other model formats.
+
+- **ConvRot INT8** (`int8_tensorwise` + `convrot:true`) — plain / ConvRot Linear / ConvRot Conv2d scale layouts
+- **ConvRot NVFP4** (E2M1 packed) — mixed-pack checkpoints (Linear = NVFP4, Conv2d = INT8)
+- Strict no-op for checkpoints without `.comfy_quant` keys — SD1.5 / SD2 / SDXL / fp16 / fp8 are completely unaffected
+- Supported checkpoints: only models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization)
+
+Technical details: [v3.0.1 Release Notes](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.1)
 
 ## Python Version Support
 
