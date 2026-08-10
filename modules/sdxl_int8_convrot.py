@@ -255,7 +255,7 @@ def _dequantize_nvfp4_layer(
 ) -> str:
     """Dequantize a single NVFP4 Linear layer in-place.
 
-    Returns "nvfp4_plain" or "nvfp4_convrot" on success, "skipped" on failure.
+    Returns "nvfp4_plain" or "nvfp4_convrot" on success, "nvfp4_skipped" on failure.
     """
     weight_key = prefix + ".weight"
     scale_key = prefix + ".weight_scale"        # block scales (float8_e4m3fn)
@@ -268,14 +268,14 @@ def _dequantize_nvfp4_layer(
     tensor_scale = state_dict.get(scale_2_key)
 
     if weight is None or block_scale is None or tensor_scale is None:
-        return "skipped"
+        return "nvfp4_skipped"
 
     # Import comfy_kitchen for dequantize_nvfp4
     try:
         import comfy_kitchen as ck
     except ImportError:
         print(f"[NVFP4] ERROR: comfy_kitchen not available, cannot dequantize {prefix}")
-        return "skipped"
+        return "nvfp4_skipped"
 
     # Dequantize: packed uint8 → float (padded shape)
     # ck.dequantize_nvfp4(qx, per_tensor_scale, block_scales, output_type, hi_first)
@@ -346,7 +346,7 @@ def dequantize_nvfp4_state_dict(
     stats = {
         "nvfp4_plain": 0,
         "nvfp4_convrot": 0,
-        "skipped": 0,
+        "nvfp4_skipped": 0,
     }
 
     cq_keys = [k for k in list(state_dict.keys()) if k.endswith(".comfy_quant")]
