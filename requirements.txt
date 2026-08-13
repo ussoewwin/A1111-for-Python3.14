@@ -11,6 +11,7 @@ fastapi>=0.90.1
 gradio==3.41.2
 inflection
 jsonmerge
+k-diffusion==0.0.16
 kornia
 lark
 numpy
