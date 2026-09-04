@@ -975,7 +975,6 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         reset_kernel_log()
     except ImportError:
         pass
-    print("[A1111] xformers.memory_efficient_attention called (FA-3→FA-2→Cutlass priority order)")
     # --- End add ---
     reset_fa3_log()
     

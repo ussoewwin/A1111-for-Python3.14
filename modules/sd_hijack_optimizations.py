@@ -44,7 +44,7 @@ sgm_diffusionmodules_model_AttnBlock_forward = sgm.modules.diffusionmodules.mode
 
 FA3_LOGGED_THIS_GEN = False
 
-# Flash-Attention direct import (without xformers)
+# Flash-Attention direct import (without xformers) - Forge-compatible direct load
 FLASH_ATTN_AVAILABLE = False
 FLASH_ATTN_VERSION = None
 FLASH_ATTN_TYPE = None  # "FA-3" or "FA-2"
@@ -53,27 +53,58 @@ _flash_attn_log_shown = False
 # SDP は巨大な attention 行列を確保するため、シーケンス長がこれを超える場合は最初から sub_quad を使う（OOM 防止）
 SDP_ATTNBLOCK_MAX_SEQ = 4096
 
-if shared.cmd_opts.flash_attention:
+
+def _module_file(mod) -> str:
+    return str(getattr(mod, "__file__", None) or "?")
+
+
+def _callable_file(fn) -> str:
+    """Resolve the on-disk path of the callable's defining module (kernel proof)."""
     try:
-        import flash_attn
-        from flash_attn import flash_attn_func
-        FLASH_ATTN_AVAILABLE = True
-        FLASH_ATTN_VERSION = flash_attn.__version__
-        
-        # Determine FA-3 or FA-2 based on version
-        version_parts = FLASH_ATTN_VERSION.split('.')
-        major_version = int(version_parts[0])
-        
-        if major_version >= 3:
-            FLASH_ATTN_TYPE = "FA-3"
-        else:
-            FLASH_ATTN_TYPE = "FA-2"
-            
-        print(f"[A1111] Flash-Attention direct import: {FLASH_ATTN_TYPE} version {FLASH_ATTN_VERSION}")
-    except ImportError as e:
+        import importlib
+
+        return _module_file(importlib.import_module(fn.__module__))
+    except Exception:
+        return "?"
+
+
+def _module_version(mod, dist_name: str) -> str:
+    ver = getattr(mod, "__version__", None)
+    if ver:
+        return str(ver)
+    try:
+        import importlib.metadata
+
+        return str(importlib.metadata.version(dist_name))
+    except Exception:
+        return "?"
+
+
+# Always try direct Flash-Attention import (Forge-compatible direct load)
+try:
+    import flash_attn
+    from flash_attn import flash_attn_func  # noqa: F401
+    FLASH_ATTN_AVAILABLE = True
+    FLASH_ATTN_VERSION = _module_version(flash_attn, "flash-attn")
+    
+    # Determine FA-3 or FA-2 based on version
+    major_version = 2
+    if FLASH_ATTN_VERSION and FLASH_ATTN_VERSION != "unknown":
+        try:
+            major_version = int(str(FLASH_ATTN_VERSION).split('.')[0])
+        except Exception:
+            pass
+    
+    FLASH_ATTN_TYPE = "FA-3" if major_version >= 3 else "FA-2"
+    print(f"[A1111] Flash-Attention direct import: {FLASH_ATTN_TYPE} version {FLASH_ATTN_VERSION}")
+except ImportError as e:
+    FLASH_ATTN_AVAILABLE = False
+    if getattr(shared.cmd_opts, "flash_attention", False):
         print(f"[A1111] WARNING: --flash-attention specified but flash-attn is not installed: {e}")
         print("[A1111] Install with: pip install flash-attn --no-build-isolation")
-    except Exception as e:
+except Exception as e:
+    FLASH_ATTN_AVAILABLE = False
+    if getattr(shared.cmd_opts, "flash_attention", False):
         print(f"[A1111] WARNING: --flash-attention specified but flash_attn failed to load: {e}")
 
 
@@ -248,11 +279,10 @@ class SdOptimizationFlashAttn(SdOptimization):
     name = "flash-attention"
     label = "Flash Attention 3/2 (direct)"
     cmd_opt = "flash_attention"
-    priority = 50  # Lower priority than xformers (use only when xformers is not available)
+    priority = 110  # Highest priority (direct FA-2/FA-3 without xformers)
 
     def is_available(self):
-        # Only available if xformers is NOT available and FA is available
-        return FLASH_ATTN_AVAILABLE and not shared.xformers_available and torch.cuda.is_available() and (6, 0) <= torch.cuda.get_device_capability(shared.device)
+        return FLASH_ATTN_AVAILABLE and torch.cuda.is_available() and (6, 0) <= torch.cuda.get_device_capability(shared.device)
 
     def apply(self):
         ldm.modules.attention.CrossAttention.forward = flash_attention_forward
@@ -770,9 +800,15 @@ def flash_attention_forward(self, x, context=None, mask=None, **kwargs):
         # Call flash_attn_func directly
         out = flash_attn_func(q, k, v, dropout_p=0.0, causal=False)
         
-        # Log only once per generation
+        # Log only after real kernel returns once per generation (matching Forge attention_backend_info.py)
         if not _flash_attn_log_shown:
-            print(f"[A1111] {FLASH_ATTN_TYPE} (Flash-Attention {FLASH_ATTN_VERSION}) called directly")
+            import flash_attn as flash_attn_mod
+            ver = _module_version(flash_attn_mod, "flash-attn") or FLASH_ATTN_VERSION
+            path = _callable_file(flash_attn_func)
+            if path == "?":
+                path = _module_file(flash_attn_mod)
+            label = FLASH_ATTN_TYPE or "FA-2"
+            print(f"[A1111] {label} kernel ran: {flash_attn_func.__module__}.{flash_attn_func.__name__} ver={ver} file={path}")
             _flash_attn_log_shown = True
         
         # Convert back to original dtype if needed
@@ -785,8 +821,8 @@ def flash_attention_forward(self, x, context=None, mask=None, **kwargs):
         return self.to_out(out)
         
     except Exception as e:
-        print(f"[A1111] Flash-Attention direct failed: {e}")
-        print("[A1111] Fallback: torch.nn.functional.scaled_dot_product_attention")
+        label = FLASH_ATTN_TYPE or "FA-2"
+        print(f"[A1111] {label} kernel NOT used — flash_attn_func failed ({e}); fallback pytorch SDPA")
         # Fallback to SDPA
         try:
             h = self.heads
@@ -857,9 +893,15 @@ def flash_attn_attnblock_forward(self, x):
         # Call flash_attn_func directly
         out = flash_attn_func(q, k, v, dropout_p=0.0, causal=False)
         
-        # Log only once per generation
+        # Log only after real kernel returns once per generation (matching Forge attention_backend_info.py)
         if not _flash_attn_log_shown:
-            print(f"[A1111] {FLASH_ATTN_TYPE} (Flash-Attention {FLASH_ATTN_VERSION}) called directly")
+            import flash_attn as flash_attn_mod
+            ver = _module_version(flash_attn_mod, "flash-attn") or FLASH_ATTN_VERSION
+            path = _callable_file(flash_attn_func)
+            if path == "?":
+                path = _module_file(flash_attn_mod)
+            label = FLASH_ATTN_TYPE or "FA-2"
+            print(f"[A1111] {label} kernel ran: {flash_attn_func.__module__}.{flash_attn_func.__name__} ver={ver} file={path}")
             _flash_attn_log_shown = True
         
         # Convert back to original dtype if needed
@@ -875,8 +917,8 @@ def flash_attn_attnblock_forward(self, x):
         return x + out
         
     except Exception as e:
-        print(f"[A1111] Flash-Attention in AttnBlock failed: {e}")
-        print("[A1111] Falling back to SDPA")
+        label = FLASH_ATTN_TYPE or "FA-2"
+        print(f"[A1111] {label} kernel NOT used (AttnBlock) — flash_attn_func failed ({e}); fallback pytorch SDPA")
         try:
             return sdp_no_mem_attnblock_forward(self, x)
         except Exception as e2:

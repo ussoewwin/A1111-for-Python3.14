@@ -78,16 +78,16 @@ def apply_optimizations(option=None):
 
     selection = option or shared.opts.cross_attention_optimization
     if selection == "Automatic" and len(optimizers) > 0:
-        # Prefer xformers when available or explicitly requested
-        try:
+        # Check if an explicit command line option requested a specific optimizer
+        explicit_cmd_opt = next(iter([x for x in optimizers if x.cmd_opt and getattr(shared.cmd_opts, x.cmd_opt, False)]), None)
+        if explicit_cmd_opt is not None:
+            matching_optimizer = explicit_cmd_opt
+        elif getattr(shared.cmd_opts, "xformers", False) or getattr(shared.cmd_opts, "xformers_flash_attention", False):
             xformers_opt = next((x for x in optimizers if isinstance(x, sd_hijack_optimizations.SdOptimizationXformers)), None)
-        except Exception:
-            xformers_opt = None
-
-        if xformers_opt is not None and xformers_opt.is_available() and (getattr(shared.cmd_opts, "xformers", False) or getattr(shared.cmd_opts, "xformers_flash_attention", False) or getattr(shared, "xformers_available", False)):
-            matching_optimizer = xformers_opt
+            matching_optimizer = xformers_opt if xformers_opt and xformers_opt.is_available() else optimizers[0]
         else:
-            matching_optimizer = next(iter([x for x in optimizers if x.cmd_opt and getattr(shared.cmd_opts, x.cmd_opt, False)]), optimizers[0])
+            # optimizers is already sorted by priority desc (FlashAttn 110 > xformers 100 > Doggettx 90 > SDP 80/70)
+            matching_optimizer = optimizers[0]
     else:
         matching_optimizer = next(iter([x for x in optimizers if x.title() == selection]), None)
 
