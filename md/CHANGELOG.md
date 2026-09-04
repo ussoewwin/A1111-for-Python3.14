@@ -1,6 +1,19 @@
-# Release Notes (v1.01 to v3.0.1)
+# Release Notes (v1.01 to v3.0.2)
 
-This document contains release notes for versions v1.01 through v3.0.1. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.0.2. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+
+---
+
+## v3.0.2
+
+### Fixed: Restore Direct Flash-Attention 2 Auto-Detection, Priority, and Forge-Standard Kernel Proof Logging
+
+- **Fixed**: **Direct Flash-Attention 2 Auto-Detection** — Direct `flash_attn` import and capability detection is now performed automatically at startup regardless of whether `--flash-attention` CLI flag is explicitly passed. When `flash_attn` is present in the environment, the direct execution pipeline is available out of the box (`5c9084da`).
+- **Fixed**: **Optimizer Priority & Automatic Selection** — `SdOptimizationFlashAttn` priority raised to `110` (highest priority, above `xformers` 100, `Doggettx` 90, and `SDP` 80/70). Removed the obsolete `not shared.xformers_available` constraint from `is_available()`. In `modules/sd_hijack.py`, `apply_optimizations()` now properly prioritizes direct Flash-Attention under `Automatic` cross-attention optimization unless an explicit CLI optimizer flag (`--xformers`, `--opt-sdp-attention`, etc.) is supplied (`5c9084da`).
+- **Added**: **Forge-Standard Kernel Proof Logging** — Aligned with Forge-Nunchaku (`backend/attention_backend_info.py`) kernel proof principles: `[A1111] FA-2 kernel ran: <module>.<func> ver=<ver> file=<path>` is emitted strictly **after** the real CUDA kernel returns successfully (logged once per generation job). If kernel execution fails, an honest fallback notice (`[A1111] FA-2 kernel NOT used — flash_attn_func failed (...); fallback pytorch SDPA`) is output before delegating to SDPA/sub_quad (`5c9084da`).
+- **Fixed**: **Removal of Premature xformers Log** — Removed the unconditionally hardcoded `print("[A1111] xformers.memory_efficient_attention called ...")` from `modules/processing.py` `process_images_inner()`. Attention kernel logging now accurately reflects the optimizer actually executing (`5c9084da`).
+- **Summary**: Restored direct Flash-Attention 2 priority and auto-detection, aligned attention execution proof logging with Forge-Nunchaku kernel standards, and cleaned up premature log outputs.
+- **Release Note**: [v3.0.2 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.2)
 
 ---
 
