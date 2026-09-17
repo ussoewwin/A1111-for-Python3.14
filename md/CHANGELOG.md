@@ -1,6 +1,17 @@
-# Release Notes (v1.01 to v3.0.2)
+# Release Notes (v1.01 to v3.0.3)
 
-This document contains release notes for versions v1.01 through v3.0.2. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.0.3. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+
+---
+
+## v3.0.3
+
+### Updated: NumPy 2.5.3 Pinned Across Startup and Requirements
+
+- **Updated**: **NumPy 2.4.6 → 2.5.3** — the startup force-pin in `modules/launch_utils.py` is raised from `numpy==2.4.6` to `numpy==2.5.3` (early install before `-r`, plus post-extension re-pin; PyPI `scipy==1.16.1` retained), and `requirements_versions_py314.txt` / `requirements_versions_py314_windows.txt` are pinned to `numpy==2.5.3` (`ec24aa60`).
+- **Fixed**: **numba / NumPy compatibility** — numba upgraded to `0.67.0` (`llvmlite 0.49.0`), which requires `numpy<2.6` and therefore coexists with NumPy 2.5.3; the former `numpy<2.5` conflict from numba `0.66.0` is resolved and `facexlib==0.3.0` remains functional (`ec24aa60`).
+- **Summary**: NumPy lifted to 2.5.3 in both the startup pin and the Python 3.14 requirement files, with numba 0.67.0 / llvmlite 0.49.0 keeping the numba-dependent `facexlib` working.
+- **Release Note**: [v3.0.3 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.3)
 
 ---
 
