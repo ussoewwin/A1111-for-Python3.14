@@ -67,6 +67,8 @@ opencv_contrib_python>=4.9.0
 # Required by the RES4LYF sampler registration path (comfy.samplers ->
 # comfy.model_prefetch -> comfy_aimdo) and by SDXL ConvRot NVFP4
 # dequantization (comfy_kitchen.dequantize_nvfp4).
-# Keep in sync with ComfyUI-master/requirements.txt.
-comfy-kitchen==0.2.34
-comfy-aimdo==0.5.3
+# Deliberately unpinned: ComfyUI-master tracks upstream, so always install the
+# latest release (launch_utils installs requirements with -U, and
+# modules/a1111_res4lyf_samplers.py re-upgrades them at every startup).
+comfy-kitchen
+comfy-aimdo

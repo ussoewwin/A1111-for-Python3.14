@@ -26,21 +26,6 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Runtime deps of the vendored ComfyUI-master engine. Required by the RES4LYF
-# import path (comfy.samplers -> comfy.model_prefetch -> comfy_aimdo).
-# Keep in sync with requirements_versions_py314*.txt and ComfyUI-master/requirements.txt.
-COMFY_KITCHEN_VERSION = "0.2.34"
-COMFY_AIMDO_VERSION = "0.5.3"
-
-
-def _installed_version(dist_name: str) -> Optional[str]:
-    """Return the installed distribution version, or ``None`` when it is absent."""
-    try:
-        from importlib import metadata
-        return metadata.version(dist_name)
-    except Exception:
-        return None
-
 
 def _ensure_comfyui_on_path() -> Optional[str]:
     """``ComfyUI-master`` を sys.path に挿入。既にあれば何もしない。"""
@@ -56,7 +41,7 @@ def _ensure_comfyui_on_path() -> Optional[str]:
 
 
 def _install_optional_deps() -> None:
-    """Install the optional deps at their pinned versions. Failures are non-fatal."""
+    """Install the optional deps. Failures are non-fatal."""
     try:
         from modules import launch_utils
     except ImportError:
@@ -69,18 +54,15 @@ def _install_optional_deps() -> None:
             logger.info("[RES4LYF] Installed pywavelets")
         except Exception as e:
             logger.warning(f"[RES4LYF] Failed to install pywavelets: {e}")
-    if _installed_version("comfy-kitchen") != COMFY_KITCHEN_VERSION:
-        try:
-            run_pip(f"install comfy-kitchen=={COMFY_KITCHEN_VERSION}", "comfy-kitchen")
-            logger.info(f"[RES4LYF] Installed comfy-kitchen=={COMFY_KITCHEN_VERSION}")
-        except Exception as e:
-            logger.warning(f"[RES4LYF] Failed to install comfy-kitchen: {e}")
-    if _installed_version("comfy-aimdo") != COMFY_AIMDO_VERSION:
-        try:
-            run_pip(f"install comfy-aimdo=={COMFY_AIMDO_VERSION}", "comfy-aimdo")
-            logger.info(f"[RES4LYF] Installed comfy-aimdo=={COMFY_AIMDO_VERSION}")
-        except Exception as e:
-            logger.warning(f"[RES4LYF] Failed to install comfy-aimdo: {e}")
+    # comfy-kitchen / comfy-aimdo are runtime deps of the vendored ComfyUI-master
+    # engine (comfy.samplers -> comfy.model_prefetch -> comfy_aimdo). ComfyUI-master
+    # tracks upstream, so these are deliberately NOT pinned: always upgrade to the
+    # latest release. Non-fatal: startup continues if the update fails.
+    try:
+        run_pip("install -U comfy-kitchen comfy-aimdo", "comfy-kitchen / comfy-aimdo")
+        logger.info("[RES4LYF] Ensured latest comfy-kitchen / comfy-aimdo")
+    except Exception as e:
+        logger.warning(f"[RES4LYF] Failed to update comfy-kitchen / comfy-aimdo: {e}")
 
 
 def _mock_comfyui_globals() -> None:
