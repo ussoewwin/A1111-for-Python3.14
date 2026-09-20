@@ -211,7 +211,8 @@ def model_hash(filename):
             file.seek(0x100000)
             m.update(file.read(0x10000))
             return m.hexdigest()[0:8]
-    except FileNotFoundError:
+    except OSError:
+        print(f"Warning: skipping unreadable checkpoint (hash): {filename}", file=sys.stderr)
         return 'NOFILE'
 
 
