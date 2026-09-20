@@ -62,3 +62,11 @@ huggingface_hub>=0.20.0
 # on demand in extensions-builtin/stable-diffusion-webui-wd14-tagger (ONNX needs neither).
 jsonschema
 opencv_contrib_python>=4.9.0
+
+# ComfyUI-master (vendored engine) runtime dependencies.
+# Required by the RES4LYF sampler registration path (comfy.samplers ->
+# comfy.model_prefetch -> comfy_aimdo) and by SDXL ConvRot NVFP4
+# dequantization (comfy_kitchen.dequantize_nvfp4).
+# Keep in sync with ComfyUI-master/requirements.txt.
+comfy-kitchen==0.2.34
+comfy-aimdo==0.5.3

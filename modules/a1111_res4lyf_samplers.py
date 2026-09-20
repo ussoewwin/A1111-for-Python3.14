@@ -26,6 +26,21 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Runtime deps of the vendored ComfyUI-master engine. Required by the RES4LYF
+# import path (comfy.samplers -> comfy.model_prefetch -> comfy_aimdo).
+# Keep in sync with requirements_versions_py314*.txt and ComfyUI-master/requirements.txt.
+COMFY_KITCHEN_VERSION = "0.2.34"
+COMFY_AIMDO_VERSION = "0.5.3"
+
+
+def _installed_version(dist_name: str) -> Optional[str]:
+    """Return the installed distribution version, or ``None`` when it is absent."""
+    try:
+        from importlib import metadata
+        return metadata.version(dist_name)
+    except Exception:
+        return None
+
 
 def _ensure_comfyui_on_path() -> Optional[str]:
     """``ComfyUI-master`` を sys.path に挿入。既にあれば何もしない。"""
@@ -41,7 +56,7 @@ def _ensure_comfyui_on_path() -> Optional[str]:
 
 
 def _install_optional_deps() -> None:
-    """``pywavelets`` / ``comfy-kitchen`` を可能なら pip で入れる。失敗しても致命的にしない。"""
+    """Install the optional deps at their pinned versions. Failures are non-fatal."""
     try:
         from modules import launch_utils
     except ImportError:
@@ -54,12 +69,18 @@ def _install_optional_deps() -> None:
             logger.info("[RES4LYF] Installed pywavelets")
         except Exception as e:
             logger.warning(f"[RES4LYF] Failed to install pywavelets: {e}")
-    if not is_installed("comfy-kitchen") and not is_installed("comfy_kitchen"):
+    if _installed_version("comfy-kitchen") != COMFY_KITCHEN_VERSION:
         try:
-            run_pip("install comfy-kitchen", "comfy-kitchen")
-            logger.info("[RES4LYF] Installed comfy-kitchen")
+            run_pip(f"install comfy-kitchen=={COMFY_KITCHEN_VERSION}", "comfy-kitchen")
+            logger.info(f"[RES4LYF] Installed comfy-kitchen=={COMFY_KITCHEN_VERSION}")
         except Exception as e:
             logger.warning(f"[RES4LYF] Failed to install comfy-kitchen: {e}")
+    if _installed_version("comfy-aimdo") != COMFY_AIMDO_VERSION:
+        try:
+            run_pip(f"install comfy-aimdo=={COMFY_AIMDO_VERSION}", "comfy-aimdo")
+            logger.info(f"[RES4LYF] Installed comfy-aimdo=={COMFY_AIMDO_VERSION}")
+        except Exception as e:
+            logger.warning(f"[RES4LYF] Failed to install comfy-aimdo: {e}")
 
 
 def _mock_comfyui_globals() -> None:
