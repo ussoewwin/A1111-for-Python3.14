@@ -1,6 +1,17 @@
-# Release Notes (v1.01 to v3.0.3)
+# Release Notes (v1.01 to v3.0.4)
 
-This document contains release notes for versions v1.01 through v3.0.3. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.0.4. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+
+---
+
+## v3.0.4
+
+### Fixed: Early NumPy 2.5.3 Validation & Self-Healing Against False "Torch is not able to use GPU" Startup Crash
+
+- **Fixed**: **Early NumPy 2.5.3 Validation & Self-Healing** — Added verification and self-healing for `numpy==2.5.3` before `_apply_torch_stack_pip_constraint` and `torch.cuda.is_available()` GPU check in `modules/launch_utils.py`. When a previous startup or uninstall leaves a corrupted/partial `site-packages/numpy` directory without `__init__.py`, Python imports it as a PEP 420 namespace package; `torch.testing._comparison` importing `numpy` then crashes with `AttributeError: module 'numpy' has no attribute 'ndarray'`, which previously aborted `launch.py` with a false `RuntimeError: Torch is not able to use GPU`. Corrupted residual directories are now purged and `numpy==2.5.3` is cleanly installed before PyTorch GPU checks (`6d3613db`).
+- **Fixed**: **Startup Reinstall Guard** — Wrapped startup `pip uninstall` and `--no-cache-dir` reinstalls for `numpy==2.5.3` and `scipy==1.16.1` with `check_run_python` verification. Redundant destructive uninstall/reinstall cycles on every launch are eliminated when the packages are already intact, preventing partial-uninstall corruptions (`6d3613db`).
+- **Summary**: Resolved startup deadlocks caused by corrupted NumPy namespace packages crashing PyTorch GPU checks, and eliminated redundant startup package reinstalls.
+- **Release Note**: [v3.0.4 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.4)
 
 ---
 

@@ -267,7 +267,7 @@ Pick the section for your OS and follow the steps in order.
 - **PyTorch default** (Windows / Linux CUDA): `torch==2.13.0+cu132` + `torchvision==0.28.0+cu132` via `TORCH_COMMAND` / `TORCH_INDEX_URL` (`https://download.pytorch.org/whl/cu132`). Same pin on first install for both platforms so Linux FA2 builds against the Windows FA2 stack.
 - **Requirements file**: Windows → `requirements_versions_py314_windows.txt`; Linux / macOS → `requirements_versions_py314.txt`.
 - **Flash-Attention 2**: Windows HF prebuilt `flash_attn-2.8.4+cu132torch2.13.0` cp314 / Linux PyPI `flash-attn==2.8.4` with `--no-build-isolation` (needs CUDA toolkit 13.2 + `nvcc`) / macOS skip.
-- **NumPy / SciPy**: all platforms install `numpy==2.4.6` and `scipy==1.16.1` from PyPI (no Windows-only wheel forced onto Linux). NumPy is pinned to 2.4.6 so numba/facexlib work on first install.
+- **NumPy / SciPy**: all platforms install `numpy==2.5.3` and `scipy==1.16.1` from PyPI (no Windows-only wheel forced onto Linux). NumPy is pinned to 2.5.3 so numba/facexlib work on first install.
 - **ONNX Runtime**: Windows / Linux first launch installs PyPI `onnxruntime-gpu` (InsightFace / ReActor / ADetailer). macOS uses `onnxruntime`.
 - **`clip.py` `pkg_resources` auto-fix**: `venv/Lib/...` on Windows; `venv/lib/pythonX.Y/...` on Linux / macOS (major / minor from the running interpreter).
 - **Python gate**: `check_python_version()` allows **3.14 only** (`webui.sh` default `python_cmd` is `python3.14`).
