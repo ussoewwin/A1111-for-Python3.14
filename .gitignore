@@ -52,3 +52,28 @@ trace.json
 /my test/
 /scratch/
 /謝罪文/
+
+# OpenClaw agent workspace files (local only)
+/AGENTS.md
+/SOUL.md
+/USER.md
+/TOOLS.md
+/MEMORY.md
+/IDENTITY.md
+/HEARTBEAT.md
+/.agents/
+/.openclaw/
+/.openclaw-attachments/
+/.autoclaw/
+/.autoclaw-attachments/
+/.opencode/
+/evolution-drafts/
+/memory/
+/projects/
+/config/
+/.rules_*.md
+/rules_*.md
+/memory.md
+/REMINDER.md
+/OUTPUT_RULES.md
+/workspace/
