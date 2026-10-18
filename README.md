@@ -56,16 +56,17 @@ Direct Flash-Attention 2 support with staged fallback:
 Windows: prebuilt HF wheel (`2.8.4+cu132torch2.13.0` cp314). Linux: builds `flash-attn==2.8.4` from source against the same `torch==2.13.0+cu132` stack (CUDA toolkit 13.2 + `nvcc`). macOS skips FA2 (MPS limitation).
 
 
-### SDXL ConvRot INT8 / NVFP4 Checkpoints (v3.0.1+)
+### SDXL ConvRot INT8 Checkpoints (v3.0.1+)
 
-Load SDXL checkpoints quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization) directly in A1111. Weights are offline-dequantized and Hadamard-unrotated at load time, fully isolated from all other model formats.
+Load SDXL checkpoints quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization) **ConvRot INT8 (reverse hybrid)** directly in A1111. Weights are offline-dequantized and Hadamard-unrotated at load time, fully isolated from all other model formats.
 
-- **ConvRot INT8** (`int8_tensorwise` + `convrot:true`) — plain / ConvRot Linear / ConvRot Conv2d scale layouts
-- **ConvRot NVFP4** (E2M1 packed) — mixed-pack checkpoints (Linear = NVFP4, Conv2d = INT8)
+- **ConvRot INT8** (`int8_tensorwise` + `convrot:true`) — plain / ConvRot Linear / ConvRot Conv2d scale layouts. For reverse-hybrid packs the FP16 checkpoint is the only input; per-layer trajectory-impact ranking packs the lowest-impact layers as FULL ConvRot INT8 while every other layer stays FP16.
+- **SDXL ConvRot NVFP4 development is cancelled** (HSWQ loader [v3.6.1](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.6.1)): deterministic latent-trajectory measurements showed 4-bit precision fails to preserve trajectory fidelity on SDXL (final cosine mean below the 0.90 gate; legacy decoded SSIM was masking it). SDXL is supported strictly in ConvRot INT8 for any new quantization.
+- Previously published NVFP4 / mixed-pack checkpoints (Linear = NVFP4 E2M1, Conv2d = INT8) remain **loadable** for backward compatibility: `modules/sdxl_int8_convrot.py` still auto-detects `format=nvfp4` keys and dequantizes them offline. They are legacy inputs, not a supported creation path.
 - Strict no-op for checkpoints without `.comfy_quant` keys — SD1.5 / SD2 / SDXL / fp16 / fp8 are completely unaffected
 - Supported checkpoints: only models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization)
 
-Technical details: [v3.0.1 Release Notes](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.1)
+Technical details: [v3.0.1 Release Notes](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.1), [SDXL NVFP4 cancellation](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.6.1)
 
 ## Python Version Support
 
