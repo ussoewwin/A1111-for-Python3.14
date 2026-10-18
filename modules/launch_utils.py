@@ -677,20 +677,20 @@ def prepare_environment():
         run(f'"{python}" -m {torch_command}', "Installing torch and torchvision", "Couldn't install torch", live=True)
         startup_timer.record("install torch")
 
-    # Ensure numpy==2.5.3 is intact BEFORE importing torch / torchvision:
+    # Ensure numpy==2.5.4 is intact BEFORE importing torch / torchvision:
     # A half-uninstalled site-packages/numpy directory (without __init__.py) becomes a
     # PEP 420 namespace package, causing `import torch` (via torch.testing._comparison
     # accessing np.ndarray) and `import torchvision` to crash with AttributeError,
     # which falsely triggers the "Torch is not able to use GPU" RuntimeError below.
-    if not check_run_python("import numpy; assert hasattr(numpy, 'ndarray') and numpy.__version__ == '2.5.3'"):
+    if not check_run_python("import numpy; assert hasattr(numpy, 'ndarray') and numpy.__version__ == '2.5.4'"):
         import sysconfig
         _site_pkgs = sysconfig.get_paths().get("purelib") or os.path.join(script_path, "venv", "Lib", "site-packages")
         _broken_np = os.path.join(_site_pkgs, "numpy")
         if os.path.isdir(_broken_np):
             shutil.rmtree(_broken_np, ignore_errors=True)
         run(f'"{python}" -m pip uninstall numpy -y', "uninstalling numpy", "Couldn't uninstall numpy", live=False)
-        run(f'"{python}" -m pip install --no-cache-dir numpy==2.5.3', "Installing numpy 2.5.3", "Couldn't install numpy 2.5.3", live=False)
-        print("[INFO] Installed numpy==2.5.3 from PyPI")
+        run(f'"{python}" -m pip install --no-cache-dir numpy==2.5.4', "Installing numpy 2.5.4", "Couldn't install numpy 2.5.4", live=False)
+        print("[INFO] Installed numpy==2.5.4 from PyPI")
 
     # Pin installed torch before requirements / extension installers can replace the stack.
     # CUDA hosts: pin full local tags (+cu132) so pip cannot swap to PyPI CPU.
@@ -745,12 +745,12 @@ def prepare_environment():
 
     run_pip("install --upgrade packaging", "packaging")
 
-    # Pin numpy==2.5.3 before -r.
+    # Pin numpy==2.5.4 before -r.
     # Install early so already-imported modules do not keep a stale numpy.
-    if not check_run_python("import numpy; assert hasattr(numpy, 'ndarray') and numpy.__version__ == '2.5.3'"):
+    if not check_run_python("import numpy; assert hasattr(numpy, 'ndarray') and numpy.__version__ == '2.5.4'"):
         run(f'"{python}" -m pip uninstall numpy -y', "uninstalling numpy", "Couldn't uninstall numpy", live=False)
-        run(f'"{python}" -m pip install --no-cache-dir numpy==2.5.3', "Installing numpy 2.5.3", "Couldn't install numpy 2.5.3", live=False)
-        print("[INFO] Installed numpy==2.5.3 from PyPI")
+        run(f'"{python}" -m pip install --no-cache-dir numpy==2.5.4', "Installing numpy 2.5.4", "Couldn't install numpy 2.5.4", live=False)
+        print("[INFO] Installed numpy==2.5.4 from PyPI")
 
     # Gradio from HF (METADATA version pins removed)
     run_pip(f'install "{gradio_package}"', "gradio")
@@ -762,7 +762,7 @@ def prepare_environment():
         run_pip(f"install -U --upgrade-strategy only-if-needed -r \"{requirements_file}\"", "requirements")
         startup_timer.record("install requirements")
     
-    # scipy via PyPI to match numpy 2.5.3
+    # scipy via PyPI to match numpy 2.5.4
     if not check_run_python("import scipy; assert scipy.__version__ == '1.16.1'"):
         run(f'"{python}" -m pip uninstall scipy -y', "uninstalling scipy", "Couldn't uninstall scipy", live=False)
         run(f'"{python}" -m pip install --no-cache-dir scipy==1.16.1', "Installing scipy 1.16.1", "Couldn't install scipy 1.16.1", live=False)
@@ -823,9 +823,9 @@ def prepare_environment():
     if not args.skip_install:
         run_extensions_installers(settings_file=args.ui_settings_file)
         # Keep pin if an extension installer drifted numpy.
-        if not check_run_python("import numpy; assert hasattr(numpy, 'ndarray') and numpy.__version__ == '2.5.3'"):
-            run(f'"{python}" -m pip install --force-reinstall --no-deps --no-cache-dir numpy==2.5.3', "re-pin: numpy 2.5.3", "Couldn't install numpy 2.5.3", live=False)
-            print("[INFO] Re-pinned numpy==2.5.3 after extensions")
+        if not check_run_python("import numpy; assert hasattr(numpy, 'ndarray') and numpy.__version__ == '2.5.4'"):
+            run(f'"{python}" -m pip install --force-reinstall --no-deps --no-cache-dir numpy==2.5.4', "re-pin: numpy 2.5.4", "Couldn't install numpy 2.5.4", live=False)
+            print("[INFO] Re-pinned numpy==2.5.4 after extensions")
 
     if args.update_check:
         version_check(commit)
