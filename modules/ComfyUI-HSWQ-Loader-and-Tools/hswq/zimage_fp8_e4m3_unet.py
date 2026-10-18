@@ -955,11 +955,8 @@ class HSWQFP8E4M3UNetLoader:
         return {"required": { "unet_name": (folder_paths.get_filename_list("diffusion_models"), ),
                               "weight_dtype": ([
                                   "default",
-                                  "fp8_e4m3fn",
-                                  "fp8_e4m3fn_fast",
-                                  "fp8_e5m2",
                                   "int8_tensorwise",
-                                  # Z Image / Krea only — never reuse SDXL "ConvRot NVFP4".
+                                  # Z Image only — never reuse SDXL "ConvRot NVFP4".
                                   "Z Image ConvRot NVFP4",
                               ],),
                              }}
@@ -967,9 +964,9 @@ class HSWQFP8E4M3UNetLoader:
     FUNCTION = "load_unet"
 
     CATEGORY = "advanced/loaders"
-    TITLE = "HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader"
+    TITLE = "HSWQ UNet Loader (Z Image / Krea2)"
 
-    def load_unet(self, unet_name, weight_dtype):
+    def load_unet(self, unet_name, weight_dtype, **kwargs):
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn

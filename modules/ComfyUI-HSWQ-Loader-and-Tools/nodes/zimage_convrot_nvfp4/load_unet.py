@@ -1,0 +1,430 @@
+"""Z Image / ZIT UNet load — ConvRot NVFP4 (parity) + INT8 ConvRot (ComfyUI core).
+
+Z Image ConvRot NVFP4 is **not** the SDXL TC Linear.forward path.
+``hswq/benchmark/zi_convrot_nvfp4_bench.py`` ``require_convrot_parity_forward``:
+TC wrap (``_hswq_nvfp4_full_forward``) destroys SSIM; need stock GEMM + online
+act rotate (``_hswq_nvfp4_convrot_parity``) via ``apply_nvfp4_comfy_parity``.
+
+  - Arm detect/load/LoRA bake with ``zi_comfy_quant_nvfp4.apply_comfy_quant_nvfp4_patches``,
+    then **replace** Linear.forward with comfy_parity (not stacked double-rotate).
+  - INT8 ConvRot: ComfyUI core / kitchen as-is. ``apply_comfy_quant_int8_patches``
+    only for int8_tensorwise load.
+
+All logic under ``nodes/zimage_convrot_nvfp4``. Does not edit the SDXL legacy
+package ``nodes/sdxl_convrot_nvfp4``.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import sys
+
+# ZI/Krea UNet dropdown ONLY — never share the SDXL Checkpoint Loader string.
+# SDXL legacy package (nodes/sdxl_convrot_nvfp4) NVFP4_WEIGHT_DTYPE == "ConvRot NVFP4" (separate being).
+ZI_NVFP4_WEIGHT_DTYPE = "Z Image ConvRot NVFP4"
+
+_DISPATCH_INSTALLED = False
+_INSTALL_HOOKED = False
+
+logger = logging.getLogger(__name__)
+
+
+def checkpoint_has_input_scale(unet_path) -> bool:
+    """True if the checkpoint carries >=1 calibrated ``*.input_scale`` key.
+
+    Peek the safetensors header only (no tensor data). Returns False on any
+    error so an unreadable / uncalibrated checkpoint stays on the safe parity
+    path (stock GEMM + online act rotate).
+    """
+    if not unet_path or not isinstance(unet_path, str):
+        return False
+    try:
+        from safetensors import safe_open
+
+        with safe_open(unet_path, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                if k.endswith(".input_scale"):
+                    return True
+        return False
+    except Exception as e:  # noqa: BLE001 - probe must never raise
+        logger.warning(
+            "[HSWQ NVFP4] input_scale probe failed (%s); assume parity", e
+        )
+        return False
+
+
+def zi_use_tensorcore(unet_path) -> bool:
+    """Decide TC (W4A4) vs parity (stock GEMM) for a Z Image NVFP4 pack.
+
+    TC requires calibrated ``.input_scale`` keys in the checkpoint. Without
+    them the W4A4 path quantizes activations against placeholder ones(1) ->
+    SSIM collapse, so we keep parity in that case.
+
+    Overrides (priority order):
+      HSWQ_ZI_FORCE_PARITY=1  -> always parity (escape hatch).
+      HSWQ_ZI_FORCE_TC=1      -> always TC (bench A/B; assumes calibrated scale).
+    """
+    if os.environ.get("HSWQ_ZI_FORCE_PARITY", "").strip() == "1":
+        return False
+    if os.environ.get("HSWQ_ZI_FORCE_TC", "").strip() == "1":
+        return True
+    return checkpoint_has_input_scale(unet_path)
+
+
+def _patch_load_model_weights_warnings() -> None:
+    """Filter expected missing/unexpected keys out of BaseModel.load_model_weights.
+
+    ComfyUI standard load (load_diffusion_model_state_dict -> get_model ->
+    BaseModel.load_model_weights) reports with strict=False:
+    - missing `*input_scale`: NVFP4 packs use dynamic quantization
+      (zi_nvfp4_forward reads getattr(self, "input_scale", None)); optional.
+    - unexpected `*.comfy_quant`: quantization markers consumed by the
+      quant-load patches, not model parameters.
+
+    Both are by-design; keep the warning only for truly unexpected keys.
+    ComfyUI-master files are NEVER modified (runtime patch only).
+    """
+    import logging
+
+    import comfy.model_base as mb
+
+    if getattr(mb.BaseModel.load_model_weights, "_hswq_warn_filter", False):
+        return
+    prev = mb.BaseModel.load_model_weights
+
+    def _filtered(self, sd, unet_prefix="", assign=False):
+        to_load = {}
+        keys = list(sd.keys())
+        for k in keys:
+            if k.startswith(unet_prefix):
+                to_load[k[len(unet_prefix):]] = sd.pop(k)
+        to_load = self.model_config.process_unet_state_dict(to_load)
+        m, u = self.diffusion_model.load_state_dict(to_load, strict=False, assign=assign)
+        n_m, n_u = len(m), len(u)
+        m = [x for x in m if not x.endswith("input_scale")]
+        u = [x for x in u if ".comfy_quant" not in x]
+        n_filt = (n_m - len(m)) + (n_u - len(u))
+        if n_filt:
+            print(
+                f"  [HSWQ NVFP4] load warnings filtered: {n_filt} expected keys "
+                "(input_scale missing / comfy_quant markers)",
+                flush=True,
+            )
+        if len(m) > 0:
+            logging.warning("unet missing: {}".format(m))
+        if len(u) > 0:
+            logging.warning("unet unexpected: {}".format(u))
+        del to_load
+        return self
+
+    _filtered._hswq_warn_filter = True
+    mb.BaseModel.load_model_weights = _filtered
+
+
+def apply_nvfp4_patches(unet_path=None) -> None:
+    """Arm Z Image ConvRot NVFP4 (TC if calibrated, else parity) + INT8 load."""
+    _patch_load_model_weights_warnings()
+    from .zi_comfy_quant_nvfp4 import apply_comfy_quant_nvfp4_patches
+    from ...patches.comfy_quant_int8 import apply_comfy_quant_int8_patches
+    from .nvfp4_comfy_parity import (
+        apply_nvfp4_comfy_parity,
+        require_convrot_parity_forward,
+    )
+    from .nvfp4_lora_bake import install_zimage_nvfp4_lora_bake
+
+    if not apply_comfy_quant_nvfp4_patches():
+        raise RuntimeError(
+            "[HSWQ NVFP4] Z Image: apply_comfy_quant_nvfp4_patches failed "
+            "(detect/load/LoRA bake required; see nodes/zimage_convrot_nvfp4/zi_comfy_quant_nvfp4)"
+        )
+    if zi_use_tensorcore(unet_path):
+        # Keep HSWQ TC (W4A4) Linear.forward: checkpoint has calibrated input_scale.
+        # Register NVFP4 aten.addmm (F.linear fallback of the pooled TC path).
+        from .nvfp4_addmm_patch import register_nvfp4_addmm_handler
+
+        register_nvfp4_addmm_handler()
+        print(
+            "  [HSWQ NVFP4] Z Image: TC (W4A4) forward kept "
+            "(calibrated input_scale detected)",
+            flush=True,
+        )
+    else:
+        # Replace TC Linear.forward with stock GEMM + act rotate (not double-rotate).
+        if not apply_nvfp4_comfy_parity():
+            raise RuntimeError(
+                "[HSWQ NVFP4] Z Image: apply_nvfp4_comfy_parity failed "
+                "(stock GEMM + act rotate required; TC destroys SSIM)"
+            )
+        require_convrot_parity_forward()
+    # INT8 tensorwise load only — ConvRot INT8 remains ComfyUI core / kitchen.
+    apply_comfy_quant_int8_patches()
+    # After INT8 Dynamic bake wrap: force ConvRot NVFP4 LoRA bake outermost.
+    if not install_zimage_nvfp4_lora_bake(force=True):
+        raise RuntimeError(
+            "[HSWQ NVFP4] Z Image: install_zimage_nvfp4_lora_bake failed "
+            "(Dynamic ConvRot NVFP4 LoRA bake required)"
+        )
+    print(
+        "  [HSWQ NVFP4] Z Image: ConvRot NVFP4 + INT8 ConvRot "
+        "+ Dynamic NVFP4 LoRA bake",
+        flush=True,
+    )
+
+
+def _ensure_dynamic_load_bake_wrap() -> None:
+    """Re-arm ZI NVFP4 bake wrap if MultiGPU/INT8 overwrote Dynamic.load or load_models_gpu."""
+    from .nvfp4_lora_bake import (
+        _BAKE_HOOK_VER,
+        install_load_models_gpu_bake_hook,
+        install_zimage_nvfp4_lora_bake,
+    )
+
+    try:
+        import comfy.model_management as mm
+        import comfy.model_patcher as mp
+    except ImportError:
+        return
+    Dynamic = getattr(mp, "ModelPatcherDynamic", None)
+    need_force = True
+    if Dynamic is not None:
+        cur = getattr(Dynamic, "load", None)
+        if (
+            cur is not None
+            and getattr(cur, "_hswq_zi_nvfp4_lora_bake", False)
+            and getattr(cur, "_hswq_zi_nvfp4_lora_bake_ver", 0) >= _BAKE_HOOK_VER
+        ):
+            need_force = False
+    if need_force:
+        install_zimage_nvfp4_lora_bake(force=True)
+    gpu = getattr(mm, "load_models_gpu", None)
+    if (
+        gpu is None
+        or not getattr(gpu, "_hswq_zi_nvfp4_gpu_bake", False)
+        or getattr(gpu, "_hswq_zi_nvfp4_gpu_bake_ver", 0) < _BAKE_HOOK_VER
+    ):
+        install_load_models_gpu_bake_hook(force=True)
+    else:
+        install_load_models_gpu_bake_hook(force=False)
+
+
+def _install_permanent_dynamic_load_guard() -> None:
+    """Install an outer ModelPatcherDynamic.load guard the purge cannot peel.
+
+    The purge uninstall_zimage_nvfp4_lora_bake walks the chain of wraps stamped
+    ``_hswq_zi_nvfp4_lora_bake`` and restores the unwrapped Dynamic.load. After that,
+    nothing re-installs the bake hook because ComfyUI caches the loader-node output
+    and never re-runs load_unet. The 2nd generation then runs without the NVFP4
+    ConvRot LoRA bake and produces noise.
+
+    This guard is a separate, permanent wrap (NOT stamped ``_hswq_zi_nvfp4_lora_bake``),
+    so the purge deep-clean walks past it. On every Dynamic.load it ensures the bake
+    hook is installed via ``_ensure_dynamic_load_bake_wrap()`` (a no-op when the hook
+    is already armed at the current version).
+    """
+    try:
+        import comfy.model_patcher as mp
+    except ImportError:
+        return
+    Dynamic = getattr(mp, "ModelPatcherDynamic", None)
+    if Dynamic is None:
+        return
+    cur = getattr(Dynamic, "load", None)
+    if cur is None or getattr(cur, "_hswq_zi_rearm_guard", False):
+        return
+
+    def _guarded_load(self, *args, **kwargs):
+        try:
+            _ensure_dynamic_load_bake_wrap()
+        except Exception:
+            pass
+        return cur(self, *args, **kwargs)
+
+    _guarded_load._hswq_zi_rearm_guard = True  # type: ignore[attr-defined]
+    _guarded_load._hswq_zi_rearm_guard_prev = cur  # type: ignore[attr-defined]
+    Dynamic.load = _guarded_load
+
+
+def load_unet_nvfp4_weight_dtype(unet_name, weight_dtype, **kwargs):
+    """Load Z Image / ZIT UNet with ConvRot NVFP4 (TC if calibrated, else parity)."""
+    _patch_load_model_weights_warnings()
+    import folder_paths
+    import comfy.sd
+
+    from .zi_comfy_quant_nvfp4 import apply_comfy_quant_nvfp4_patches
+    from .zi_nvfp4_forward import reset_nvfp4_lora_log_counters
+    from ...patches.comfy_quant_int8 import (
+        _int8_quant_conv_scope,
+        apply_comfy_quant_int8_patches,
+        reset_int8_lora_log_counters,
+        summarize_int8_lora_capability,
+    )
+    from .nvfp4_comfy_parity import (
+        apply_nvfp4_comfy_parity,
+        require_convrot_parity_forward,
+    )
+    from .nvfp4_lora_bake import (
+        install_zimage_nvfp4_lora_bake,
+        reset_zimage_nvfp4_lora_bake_log_counters,
+    )
+
+    unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+    if not apply_comfy_quant_nvfp4_patches():
+        raise RuntimeError(
+            "[HSWQ NVFP4] Z Image UNet requires NVFP4 detect/load/LoRA bake "
+            "(zi_comfy_quant_nvfp4.apply_comfy_quant_nvfp4_patches)"
+        )
+    if zi_use_tensorcore(unet_path):
+        # Keep HSWQ TC (W4A4) forward: calibrated input_scale present.
+        from .nvfp4_addmm_patch import register_nvfp4_addmm_handler
+
+        register_nvfp4_addmm_handler()
+        print(
+            "  [HSWQ NVFP4] Z Image: TC (W4A4) forward kept "
+            "(calibrated input_scale detected)",
+            flush=True,
+        )
+    else:
+        if not apply_nvfp4_comfy_parity():
+            raise RuntimeError(
+                "[HSWQ NVFP4] Z Image UNet requires comfy_parity "
+                "(stock GEMM + act rotate; not HSWQ TC Linear.forward)"
+            )
+        require_convrot_parity_forward()
+    # Mixed pack: Linear=nvfp4 parity, INT8 = ComfyUI core ConvRot path.
+    apply_comfy_quant_int8_patches()
+    if not install_zimage_nvfp4_lora_bake(force=True):
+        raise RuntimeError(
+            "[HSWQ NVFP4] Z Image UNet requires Dynamic ConvRot NVFP4 LoRA bake"
+        )
+    _ensure_dynamic_load_bake_wrap()
+    _install_permanent_dynamic_load_guard()
+    reset_int8_lora_log_counters()
+    reset_nvfp4_lora_log_counters()
+    reset_zimage_nvfp4_lora_bake_log_counters()
+    logging.info(
+        "[HSWQ NVFP4] Loading UNet (ConvRot NVFP4 comfy_parity + INT8 ConvRot ComfyUI core): "
+        "%s (weight_dtype=%s)",
+        unet_name,
+        weight_dtype,
+    )
+    print(
+        f"[HSWQ NVFP4] Loading UNet (ConvRot NVFP4): {unet_name}",
+        flush=True,
+    )
+    with _int8_quant_conv_scope():
+        model = comfy.sd.load_diffusion_model(unet_path, model_options={})
+    summarize_int8_lora_capability(model)
+    return (model,)
+
+
+def _attach_to_comfy_quant_module() -> None:
+    """Expose this loader on comfy_quant_nvfp4 so prestartup can bind it."""
+    for name, mod in list(sys.modules.items()):
+        if not (
+            name.endswith("nodes.sdxl_convrot_nvfp4.comfy_quant_nvfp4")
+            or name.endswith(".comfy_quant_nvfp4")
+            or name == "comfy_quant_nvfp4"
+        ):
+            continue
+        cur = getattr(mod, "load_unet_nvfp4_weight_dtype", None)
+        if cur is None or cur is load_unet_nvfp4_weight_dtype:
+            mod.load_unet_nvfp4_weight_dtype = load_unet_nvfp4_weight_dtype
+
+
+def install_zimage_nvfp4_unet_dispatch(node_class_mappings=None) -> bool:
+    """Wrap HSWQFP8E4M3UNetLoader for weight_dtype ConvRot NVFP4.
+
+    Must run *after* ``install_int8_option_dispatch``: mixed NVFP4 packs also
+    contain ``int8_tensorwise`` layers, so INT8-only auto-detect would otherwise
+    steal the load without NVFP4 Linear patches. INT8 ConvRot stays core.
+    """
+    global _DISPATCH_INSTALLED
+    if node_class_mappings is None:
+        wrapped_any = False
+        for _n, mod in list(sys.modules.items()):
+            mappings = getattr(mod, "NODE_CLASS_MAPPINGS", None)
+            if isinstance(mappings, dict) and install_zimage_nvfp4_unet_dispatch(mappings):
+                wrapped_any = True
+        return wrapped_any
+
+    if not isinstance(node_class_mappings, dict):
+        return False
+
+    from .nvfp4_conf import checkpoint_looks_like_comfy_quant_nvfp4
+
+    unet_cls = node_class_mappings.get("HSWQFP8E4M3UNetLoader")
+    if unet_cls is None:
+        return False
+    if getattr(unet_cls, "_hswq_zi_nvfp4_dispatch", False):
+        _DISPATCH_INSTALLED = True
+        return True
+
+    _fp8 = frozenset({"fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"})
+    _prev = unet_cls.load_unet
+
+    def load_unet(self, unet_name, weight_dtype, **kwargs):
+        # Pass through any loader options (e.g. attention_accel) unchanged.
+        _ensure_dynamic_load_bake_wrap()
+        _install_permanent_dynamic_load_guard()
+        if weight_dtype in _fp8:
+            return _prev(self, unet_name, weight_dtype, **kwargs)
+        if weight_dtype == ZI_NVFP4_WEIGHT_DTYPE:
+            return load_unet_nvfp4_weight_dtype(
+                unet_name, weight_dtype,
+            )
+        import folder_paths
+
+        if weight_dtype == "default":
+            unet_path = folder_paths.get_full_path_or_raise(
+                "diffusion_models", unet_name
+            )
+            if checkpoint_looks_like_comfy_quant_nvfp4(unet_path):
+                return load_unet_nvfp4_weight_dtype(
+                    unet_name, weight_dtype,
+                )
+        # Never treat SDXL's "ConvRot NVFP4" string as ZI — different being.
+        # int8_tensorwise / other: leave to INT8 dispatch / original (core ConvRot).
+        return _prev(self, unet_name, weight_dtype, **kwargs)
+
+    unet_cls.load_unet = load_unet
+    unet_cls._hswq_zi_nvfp4_dispatch = True  # type: ignore[attr-defined]
+    _DISPATCH_INSTALLED = True
+    print(
+        f"[HSWQ NVFP4] Z Image UNet dispatch: {ZI_NVFP4_WEIGHT_DTYPE!r} "
+        "-> nodes.zimage_convrot_nvfp4 (comfy_parity; not SDXL ConvRot NVFP4)",
+        flush=True,
+    )
+    return True
+
+
+def _hook_nvfp4_install_for_unet_dispatch() -> None:
+    """When package ``__init__`` runs SDXL NVFP4 install, also wrap Z Image UNet."""
+    global _INSTALL_HOOKED
+    if _INSTALL_HOOKED:
+        return
+    for name, mod in list(sys.modules.items()):
+        if not (
+            name.endswith("nodes.sdxl_convrot_nvfp4.comfy_quant_nvfp4")
+            or name.endswith(".comfy_quant_nvfp4")
+            or name == "comfy_quant_nvfp4"
+        ):
+            continue
+        prev = getattr(mod, "install_nvfp4_option_dispatch", None)
+        if prev is None or getattr(prev, "_hswq_zi_unet_hook", False):
+            continue
+
+        def install_nvfp4_option_dispatch(node_class_mappings, _prev=prev):
+            ok = _prev(node_class_mappings)
+            install_zimage_nvfp4_unet_dispatch(node_class_mappings)
+            return ok
+
+        install_nvfp4_option_dispatch._hswq_zi_unet_hook = True  # type: ignore[attr-defined]
+        mod.install_nvfp4_option_dispatch = install_nvfp4_option_dispatch
+        _INSTALL_HOOKED = True
+        return
+
+
+# Import-time: register on comfy_quant; hook SDXL install so UNet wrap runs after INT8.
+_attach_to_comfy_quant_module()
+_hook_nvfp4_install_for_unet_dispatch()
+install_zimage_nvfp4_unet_dispatch()

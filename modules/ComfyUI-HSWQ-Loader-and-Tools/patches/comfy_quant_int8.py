@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import threading
+import torch
 
 logger = logging.getLogger(__name__)
 _PATCHES_APPLIED = False
@@ -546,6 +547,40 @@ def _probe_path_needs_hswq_int8_conv2d(path: str) -> bool:
         return True
 
 
+def checkpoint_is_krea2(state_dict_or_path) -> bool:
+    """True if checkpoint is Krea2 (DiT carrying the txtfusion projector).
+
+    Krea2's state dict carries ``{prefix}txtfusion.projector.weight``; the
+    txtfusion projector is Krea2-specific. Keyed off that marker (not filename
+    / image_model) so a rename or substring collision cannot flip the answer.
+    """
+    if isinstance(state_dict_or_path, (str, os.PathLike)):
+        return _probe_path_is_krea2(str(state_dict_or_path))
+
+    state_dict = state_dict_or_path
+    keys = getattr(state_dict, "keys", None)
+    if keys is None:
+        return False
+    try:
+        return any(k.endswith("txtfusion.projector.weight") for k in keys())
+    except Exception:
+        return False
+
+
+def _probe_path_is_krea2(path: str) -> bool:
+    """Lightweight safetensors probe for the Krea2 txtfusion projector."""
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return "krea" in os.path.basename(path).lower()
+    try:
+        with safe_open(path, framework="pt", device="cpu") as f:
+            return any(k.endswith("txtfusion.projector.weight") for k in f.keys())
+    except Exception as e:
+        logger.debug("[HSWQ INT8] krea2 probe failed for %s: %s", path, e)
+        return "krea" in os.path.basename(path).lower()
+
+
 def _probe_path_comfy_quant_convrot(path: str) -> bool:
     """Lightweight safetensors probe for comfy_quant.convrot=true."""
     try:
@@ -784,7 +819,7 @@ def _model_has_int8_quantized_weights(model) -> bool:
 
     SDXL ConvRot NVFP4 (Checkpoint Loader dropdown ``ConvRot NVFP4``):
       bake must see NVFP4 Linear QT so ``patch_weight_to_device`` runs
-      nodes/nvfp4 ConvRot convert/set_weight (3.3.0 SDXL path).
+      nodes/sdxl_convrot_nvfp4 ConvRot convert/set_weight (3.3.0 SDXL path).
 
     Z Image ConvRot NVFP4 (UNet dropdown ``Z Image ConvRot NVFP4``):
       do not treat as the SDXL bake path — see ``_model_is_zimage_nvfp4_parity``.
@@ -819,7 +854,7 @@ def _model_has_int8_quantized_weights(model) -> bool:
 
 
 def _load_native_convert_int8_helpers():
-    """Lazy-load Hadamard / rotate helpers from sibling native_convert_int8.py."""
+    """Lazy-load Hadamard / rotate helpers from nodes/native_convert_int8.py."""
     import importlib.util
     import sys
 
@@ -834,7 +869,7 @@ def _load_native_convert_int8_helpers():
         _NATIVE_CONVERT_INT8_MOD = existing
         return existing
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(root, "native_convert_int8.py")
+    path = os.path.join(root, "nodes", "native_convert_int8.py")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"native_convert_int8.py not found: {path}")
     spec = importlib.util.spec_from_file_location(name, path)
@@ -1409,7 +1444,7 @@ def _bake_int8_patches_on_dynamic_patcher(patcher, device_to) -> int:
     if _model_is_nunchaku_svdq(getattr(patcher, "model", None)):
         return 0
     # Absolute branch: Z Image / Krea parity packs use zimage_nvfp4 bake only.
-    # Never apply the SDXL (3.3.0 nodes/nvfp4) Dynamic bake to them.
+    # Never apply the SDXL (3.3.0 nodes/sdxl_convrot_nvfp4) Dynamic bake to them.
     if _model_is_zimage_nvfp4_parity(getattr(patcher, "model", None)):
         return 0
     if not getattr(patcher, "patches", None):
@@ -1445,7 +1480,7 @@ def _bake_int8_patches_on_dynamic_patcher(patcher, device_to) -> int:
             # 0.30.2: weight may be Parameter(QuantizedTensor) - unwrap for isinstance check
             weight_inner = weight.data if hasattr(weight, "data") else weight
             # SDXL path (3.3.0): bake all comfy_quant QuantizedTensor — never bare int8.
-            # NVFP4 Linear uses nodes/nvfp4 ConvRot convert/set_weight.
+            # NVFP4 Linear uses nodes/sdxl_convrot_nvfp4 ConvRot convert/set_weight.
             # Z Image path never reaches here (parity early-return above).
             if not isinstance(weight_inner, QuantizedTensor):
                 continue
@@ -1519,6 +1554,8 @@ def _patch_model_patcher_dynamic_int8_lora_bake() -> bool:
             full_load=full_load,
             dirty=dirty,
         )
+        if not bool(getattr(self.model, "_hswq_bake_enabled", True)):
+            return result
         # INT8 LoRA bake only — never touch Nunchaku SVDQ (class is often Lumina2).
         if _model_is_nunchaku_svdq(self.model):
             return result
@@ -2130,6 +2167,585 @@ def _patch_load_lora_key_counts() -> bool:
     return True
 
 
+_COMFY_KITCHEN_INT8_FALLBACK_PATCHED = False
+
+
+def _patch_comfy_kitchen_int8_gemm_fallback() -> bool:
+    """Patch comfy_kitchen's cuda.int8_linear and TensorWiseINT8Layout op handlers
+    to safely handle non-multiple-of-4 dimensions (e.g. SAM3 boxRPB_embed_x K=2)
+    and GPU GEMM exceptions by falling back to float precision instead of crashing.
+    """
+    global _COMFY_KITCHEN_INT8_FALLBACK_PATCHED
+    _patch_comfy_kitchen_rms_rope_fallback()
+    if _COMFY_KITCHEN_INT8_FALLBACK_PATCHED:
+        return True
+
+    applied = []
+    import torch
+
+    # 1. Patch comfy_kitchen.backends.cuda.int8_linear (root backend kernel implementation)
+    try:
+        import comfy_kitchen.backends.cuda as ck_cuda
+
+        orig_cuda_int8_linear = getattr(ck_cuda, "int8_linear", None)
+        if orig_cuda_int8_linear is not None and not getattr(orig_cuda_int8_linear, "_hswq_safe_int8", False):
+            import inspect as _hswq_inspect
+            _orig_param_names = set(_hswq_inspect.signature(orig_cuda_int8_linear).parameters)
+            def _safe_cuda_int8_linear(
+                x: torch.Tensor,
+                weight: torch.Tensor,
+                weight_scale: torch.Tensor,
+                bias: torch.Tensor = None,
+                out_dtype: torch.dtype = None,
+                convrot: bool = False,
+                convrot_groupsize: int = 256,
+                input_act: str | None = None,
+                input_act_weight: torch.Tensor | None = None,
+                input_act_eps: float = 0.0,
+                residual: torch.Tensor | None = None,
+                residual_scale: torch.Tensor | None = None,
+                **extra_kwargs,
+            ) -> torch.Tensor:
+                orig_shape = x.shape
+                x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
+                n = weight.shape[0]
+                out_dt = out_dtype or x.dtype
+                is_2d_output = len(orig_shape) == 2
+
+                def _dequantized_linear():
+                    ws = weight_scale.to(device=x.device, dtype=torch.float32)
+                    w_float = weight.to(device=x.device, dtype=torch.float32) * (ws if ws.numel() == 1 else ws.view(-1, 1))
+                    b_arg = bias.to(device=x.device, dtype=out_dt) if bias is not None else None
+                    x_act = x_2d.to(dtype=out_dt)
+                    if input_act not in (None, "none"):
+                        _apply_act = getattr(ck_cuda, "_apply_input_act", None)
+                        if _apply_act is not None:
+                            try:
+                                x_act = _apply_act(
+                                    x_act, input_act, input_act_weight, float(input_act_eps)
+                                ).to(dtype=out_dt)
+                            except Exception:
+                                pass
+                    res = torch.nn.functional.linear(x_act, w_float.to(dtype=out_dt), b_arg)
+                    if residual is not None:
+                        _apply_res = getattr(ck_cuda, "_apply_residual", None)
+                        if _apply_res is not None:
+                            try:
+                                res = _apply_res(res, residual.reshape(res.shape), residual_scale)
+                            except Exception:
+                                pass
+                    return res if is_2d_output else res.reshape(*orig_shape[:-1], n)
+
+                # Hardware unaligned check (cuBLAS GEMM requires K % 4 == 0 and N % 4 == 0)
+                if x_2d.shape[-1] % 4 != 0 or n % 4 != 0 or not x.is_cuda:
+                    return _dequantized_linear()
+
+                call_kwargs = {
+                    "x": x,
+                    "weight": weight,
+                    "weight_scale": weight_scale,
+                    "bias": bias,
+                    "out_dtype": out_dtype,
+                    "convrot": convrot,
+                    "convrot_groupsize": convrot_groupsize,
+                }
+                for _name, _value in (
+                    ("input_act", input_act),
+                    ("input_act_weight", input_act_weight),
+                    ("input_act_eps", input_act_eps),
+                    ("residual", residual),
+                    ("residual_scale", residual_scale),
+                ):
+                    if _name in _orig_param_names:
+                        call_kwargs[_name] = _value
+                for _name, _value in extra_kwargs.items():
+                    if _name in _orig_param_names:
+                        call_kwargs[_name] = _value
+
+                try:
+                    return orig_cuda_int8_linear(**call_kwargs)
+                except Exception as e:
+                    logger.debug("[HSWQ INT8] cuda.int8_linear fallback (k=%d, n=%d): %s", x_2d.shape[-1], n, e)
+                    return _dequantized_linear()
+
+            _safe_cuda_int8_linear._hswq_safe_int8 = True
+            ck_cuda.int8_linear = _safe_cuda_int8_linear
+            applied.append("cuda.int8_linear")
+    except Exception as e:
+        logger.debug("[HSWQ INT8] comfy_kitchen.backends.cuda patch failed: %s", e)
+
+    # 2. Patch comfy_kitchen.tensor layout dispatchers
+    try:
+        import comfy_kitchen.tensor.base as ck_base
+        import comfy_kitchen.tensor.int8 as ck_int8
+
+        QuantizedTensor = ck_base.QuantizedTensor
+        TensorWiseINT8Layout = getattr(ck_int8, "TensorWiseINT8Layout", None)
+        if TensorWiseINT8Layout is None:
+            TensorWiseINT8Layout = ck_base.get_layout_class("TensorWiseINT8Layout")
+        _LAYOUT_DISPATCH_TABLE = ck_base._LAYOUT_DISPATCH_TABLE
+        dequantize_args = ck_base.dequantize_args
+        _dtype_code = ck_int8._dtype_code
+
+        def _dq_linear_dtype_safe(_a, _k):
+            # [HSWQ-FIX 2026-10-04] Dequantized int8 weights come back as params.orig_dtype
+            # (e.g. bfloat16) while the activation may be float32 (CPU path), which makes
+            # F.linear raise "self and mat2 must have the same dtype". Cast weight/bias to the
+            # activation dtype so the fallback works on CPU as well as CUDA.
+            _a2 = list(dequantize_args(_a))
+            _k2 = dequantize_args(_k)
+            _x = _a2[0]
+            _dt = getattr(_k2, 'get', lambda *_: None)('out_dtype', None) or _x.dtype
+            _a2[0] = _x.to(_dt)
+            if len(_a2) > 1 and torch.is_tensor(_a2[1]):
+                _a2[1] = _a2[1].to(_dt)
+            if len(_a2) > 2 and torch.is_tensor(_a2[2]):
+                _a2[2] = _a2[2].to(_dt)
+            if 'out_dtype' in _k2:
+                _k2.pop('out_dtype')
+            return _a2, _k2
+
+        def _safe_handle_int8_linear_tensorwise(qt, args, kwargs):
+            input_tensor = args[0]
+            weight = args[1]
+            bias = args[2] if len(args) > 2 else None
+
+            if not isinstance(weight, QuantizedTensor) or getattr(weight, "_layout_cls", None) != "TensorWiseINT8Layout":
+                _a, _k = _dq_linear_dtype_safe(args, kwargs)
+                return torch.nn.functional.linear(*_a, **_k)
+            if getattr(weight._params, "transposed", False):
+                _a, _k = _dq_linear_dtype_safe(args, kwargs)
+                return torch.nn.functional.linear(*_a, **_k)
+
+            if isinstance(input_tensor, QuantizedTensor):
+                input_tensor = input_tensor.dequantize()
+
+            weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+            k = input_tensor.shape[-1]
+            n = weight_qdata.shape[0]
+
+            if not input_tensor.is_cuda or k % 4 != 0 or n % 4 != 0:
+                _a, _k = _dq_linear_dtype_safe(args, kwargs)
+                return torch.nn.functional.linear(*_a, **_k)
+
+            out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
+            convrot = getattr(weight._params, "convrot", False)
+            convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
+
+            scale = weight_scale.squeeze(-1).contiguous() if isinstance(weight_scale, torch.Tensor) and weight_scale.dim() > 1 else weight_scale
+
+            try:
+                return torch.ops.comfy_kitchen.int8_linear(
+                    input_tensor.contiguous(),
+                    weight_qdata.contiguous(),
+                    scale,
+                    bias,
+                    _dtype_code(out_dtype),
+                    convrot,
+                    convrot_groupsize,
+                )
+            except Exception as e:
+                logger.debug("[HSWQ INT8] int8_linear fallback (k=%d, n=%d): %s", k, n, e)
+                _a, _k = _dq_linear_dtype_safe(args, kwargs)
+                return torch.nn.functional.linear(*_a, **_k)
+
+        def _safe_handle_int8_mm_tensorwise(qt, args, kwargs):
+            input_tensor = args[0]
+            weight = args[1]
+
+            if not isinstance(weight, QuantizedTensor) or getattr(weight, "_layout_cls", None) != "TensorWiseINT8Layout":
+                return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
+
+            if isinstance(input_tensor, QuantizedTensor):
+                input_tensor = input_tensor.dequantize()
+
+            weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+            out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
+
+            convrot = getattr(weight._params, "convrot", False)
+            convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
+            scale = weight_scale.squeeze(-1).contiguous() if isinstance(weight_scale, torch.Tensor) and weight_scale.dim() > 1 else weight_scale
+
+            if getattr(weight._params, "transposed", False):
+                int8_weight = weight_qdata.contiguous()
+            elif weight_scale.numel() == 1 and not convrot:
+                int8_weight = weight_qdata.t().contiguous()
+            else:
+                return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
+
+            k = input_tensor.shape[-1]
+            n = int8_weight.shape[0]
+            if not input_tensor.is_cuda or k % 4 != 0 or n % 4 != 0:
+                return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
+
+            try:
+                return torch.ops.comfy_kitchen.int8_linear(
+                    input_tensor.contiguous(),
+                    int8_weight,
+                    scale,
+                    None,
+                    _dtype_code(out_dtype),
+                    convrot,
+                    convrot_groupsize,
+                )
+            except Exception as e:
+                logger.debug("[HSWQ INT8] int8_mm fallback (k=%d, n=%d): %s", k, n, e)
+                return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
+
+        def _safe_handle_int8_addmm_tensorwise(qt, args, kwargs):
+            bias = args[0]
+            input_tensor = args[1]
+            weight = args[2]
+
+            if not isinstance(weight, QuantizedTensor) or getattr(weight, "_layout_cls", None) != "TensorWiseINT8Layout":
+                return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
+
+            if isinstance(input_tensor, QuantizedTensor):
+                input_tensor = input_tensor.dequantize()
+
+            weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+            out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
+
+            convrot = getattr(weight._params, "convrot", False)
+            convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
+            scale = weight_scale.squeeze(-1).contiguous() if isinstance(weight_scale, torch.Tensor) and weight_scale.dim() > 1 else weight_scale
+
+            if getattr(weight._params, "transposed", False):
+                int8_weight = weight_qdata.contiguous()
+            elif weight_scale.numel() == 1 and not convrot:
+                int8_weight = weight_qdata.t().contiguous()
+            else:
+                return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
+
+            k = input_tensor.shape[-1]
+            n = int8_weight.shape[0]
+            if not input_tensor.is_cuda or k % 4 != 0 or n % 4 != 0:
+                return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
+
+            try:
+                return torch.ops.comfy_kitchen.int8_linear(
+                    input_tensor.contiguous(),
+                    int8_weight,
+                    scale,
+                    bias,
+                    _dtype_code(out_dtype),
+                    convrot,
+                    convrot_groupsize,
+                )
+            except Exception as e:
+                logger.debug("[HSWQ INT8] int8_addmm fallback (k=%d, n=%d): %s", k, n, e)
+                return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
+
+        def _safe_dequantize(qdata, params):
+            output_dtype = getattr(params, "orig_dtype", torch.float16)
+            scale = params.scale
+            # 1. Multiply qdata by scale with correct broadcasting
+            if scale is None:
+                w_float = qdata.float()
+            elif isinstance(scale, torch.Tensor):
+                if scale.ndim == 1 and qdata.ndim == 2 and scale.shape[0] == qdata.shape[0]:
+                    w_float = qdata.float() * scale.float().unsqueeze(1)
+                elif scale.ndim == 2 and qdata.ndim == 2 and scale.shape[0] == qdata.shape[0]:
+                    w_float = qdata.float() * scale.float()
+                elif scale.numel() == 1:
+                    w_float = qdata.float() * scale.item()
+                else:
+                    try:
+                        w_float = qdata.float() * scale.float()
+                    except Exception:
+                        w_float = qdata.float() * scale.float().view(-1, 1)
+            else:
+                w_float = qdata.float() * float(scale)
+
+            # 2. Apply ConvRot Hadamard un-rotation if enabled
+            convrot = getattr(params, "convrot", False)
+            gs = getattr(params, "convrot_groupsize", 256) or 256
+            if convrot and w_float.ndim >= 2:
+                if w_float.ndim == 2:
+                    o, i = w_float.shape
+                    for cand_gs in (gs, 256, 64, 16, 4):
+                        if i % cand_gs == 0 and i // cand_gs > 0:
+                            h = _regular_hadamard_global(cand_gs, device=w_float.device)
+                            group_count = i // cand_gs
+                            w_grouped = w_float.view(o, group_count, cand_gs)
+                            w_float = torch.matmul(w_grouped, h.to(dtype=w_float.dtype, device=w_float.device)).reshape(o, i)
+                            break
+                elif w_float.ndim == 4:
+                    o, i, kh, kw = w_float.shape
+                    for cand_gs in (gs, 256, 64, 16, 4):
+                        if i % cand_gs == 0 and i // cand_gs > 0:
+                            h = _regular_hadamard_global(cand_gs, device=w_float.device)
+                            flat = w_float.permute(0, 2, 3, 1).contiguous().view(-1, i)
+                            group_count = i // cand_gs
+                            flat_grouped = flat.view(-1, group_count, cand_gs)
+                            flat_un = torch.matmul(flat_grouped, h.to(dtype=flat.dtype, device=flat.device)).reshape(-1, i)
+                            w_float = flat_un.view(o, kh, kw, i).permute(0, 3, 1, 2).contiguous()
+                            break
+
+            return w_float.to(output_dtype)
+
+        TensorWiseINT8Layout.dequantize = _safe_dequantize
+        # 3. dequantize_embedding fallback. comfy.ops.cast_bias_weight() has a
+        # CPU branch (dynamic VRAM: hasattr(s, "_v") and the target device is
+        # CPU) that returns an ALREADY-dequantized plain tensor:
+        #     weight = s.weight.to(dtype=dtype, copy=True)
+        #     if isinstance(weight, QuantizedTensor):
+        #         weight = weight.dequantize()
+        # The Embedding forward still routes that table through the INT8 layout
+        # gather, so the kitchen op rejects the fp16 ``q``:
+        #     NoCapableBackendError: dequantize_int8_embedding:
+        #         eager: q: dtype torch.float16 not in {torch.int8}
+        # Keep the genuine INT8 gather untouched (delegate to the kitchen op);
+        # for a non-INT8 table the rows are already scale-applied and ConvRot
+        # un-rotated, so gather them directly.
+        try:
+            _orig_dequantize_embedding = TensorWiseINT8Layout.dequantize_embedding
+            if not getattr(_orig_dequantize_embedding.__func__, "_hswq_safe_embed", False):
+                def _safe_dequantize_embedding(cls, qdata, params, indices):
+                    if qdata.dtype in (torch.int8, torch.uint8):
+                        return _orig_dequantize_embedding.__func__(cls, qdata, params, indices)
+                    rows = torch.nn.functional.embedding(indices, qdata)
+                    out_dtype = getattr(params, "orig_dtype", None) or rows.dtype
+                    return rows.to(dtype=out_dtype)
+                _safe_dequantize_embedding = classmethod(_safe_dequantize_embedding)
+                _safe_dequantize_embedding.__func__._hswq_safe_embed = True
+                _safe_dequantize_embedding.__func__._hswq_orig_embed = _orig_dequantize_embedding
+                TensorWiseINT8Layout.dequantize_embedding = _safe_dequantize_embedding
+                applied.append("TensorWiseINT8Layout.dequantize_embedding fallback")
+        except Exception as e:
+            logger.debug("[HSWQ INT8] dequantize_embedding patch failed: %s", e)
+
+        _LAYOUT_DISPATCH_TABLE.setdefault(torch.ops.aten.linear.default, {})[TensorWiseINT8Layout] = _safe_handle_int8_linear_tensorwise
+        _LAYOUT_DISPATCH_TABLE.setdefault(torch.ops.aten.mm.default, {})[TensorWiseINT8Layout] = _safe_handle_int8_mm_tensorwise
+        _LAYOUT_DISPATCH_TABLE.setdefault(torch.ops.aten.addmm.default, {})[TensorWiseINT8Layout] = _safe_handle_int8_addmm_tensorwise
+        ck_int8._handle_int8_linear_tensorwise = _safe_handle_int8_linear_tensorwise
+        ck_int8._handle_int8_mm_tensorwise = _safe_handle_int8_mm_tensorwise
+        ck_int8._handle_int8_addmm_tensorwise = _safe_handle_int8_addmm_tensorwise
+        applied.append("TensorWiseINT8Layout dispatch")
+    except Exception as e:
+        logger.debug("[HSWQ INT8] comfy_kitchen.tensor layout patch failed: %s", e)
+
+    if applied:
+        _COMFY_KITCHEN_INT8_FALLBACK_PATCHED = True
+        logger.info("[HSWQ INT8] comfy_kitchen TensorWiseINT8 unaligned GEMM fallback patch armed (%s)", ", ".join(applied))
+        return True
+    return False
+
+
+_COMFY_KITCHEN_RMS_ROPE_FALLBACK_PATCHED = False
+
+
+def _patch_comfy_kitchen_rms_rope_fallback() -> bool:
+    """Patch comfy_kitchen's rms_rope, rms_rope1, and registry dispatch
+    to safely execute on Blackwell (sm_120) and any GPU where CUDA fused
+    RMS-RoPE causes std::abort() or missing kernel image, falling back seamlessly
+    to eager PyTorch implementation.
+    """
+    global _COMFY_KITCHEN_RMS_ROPE_FALLBACK_PATCHED
+    if _COMFY_KITCHEN_RMS_ROPE_FALLBACK_PATCHED:
+        return True
+
+    applied = []
+    import torch
+
+    try:
+        import comfy_kitchen as ck
+        import comfy_kitchen.backends.eager.rope as eager_rope
+        from comfy_kitchen.registry import registry
+
+        is_blackwell = False
+        if torch.cuda.is_available():
+            try:
+                cap = torch.cuda.get_device_capability(torch.cuda.current_device())
+                is_blackwell = (cap[0] >= 10)
+            except Exception:
+                is_blackwell = False
+
+        # 1. Modify registry capabilities: if Blackwell (or always as safety),
+        # remove rms_rope operations from 'cuda' backend capabilities so registry dispatch
+        # (used by torch.ops.comfy_kitchen.rms_rope) routes to 'eager' instead of 'cuda'
+        cuda_caps = registry._capabilities.get("cuda", set())
+        rms_rope_ops = (
+            "rms_rope",
+            "rms_rope1",
+            "rms_rope_",
+            "rms_rope1_",
+            "rms_rope_split_half",
+            "rms_rope_split_half1",
+            "rms_rope_split_half_",
+            "rms_rope_split_half1_",
+        )
+        if is_blackwell:
+            for op in rms_rope_ops:
+                cuda_caps.discard(op)
+            applied.append("registry cuda capabilities filtered")
+
+        # 2. Safe wrapper for rms_rope
+        orig_ck_rms_rope = getattr(ck, "rms_rope", None)
+
+        def _safe_rms_rope(q, k, freqs_cis, q_scale, k_scale=None, epsilon=1e-6):
+            if k_scale is None:
+                k_scale = q_scale
+            if q_scale is not None and (q_scale.device != q.device or q_scale.dtype != q.dtype):
+                q_scale = q_scale.to(device=q.device, dtype=q.dtype)
+            if k_scale is not None and (k_scale.device != k.device or k_scale.dtype != k.dtype):
+                k_scale = k_scale.to(device=k.device, dtype=k.dtype)
+            if freqs_cis is not None and freqs_cis.device != q.device:
+                freqs_cis = freqs_cis.to(device=q.device)
+
+            cur_blackwell = False
+            if q.is_cuda:
+                try:
+                    c = torch.cuda.get_device_capability(q.device)
+                    cur_blackwell = (c[0] >= 10)
+                except Exception:
+                    pass
+
+            if cur_blackwell or is_blackwell:
+                return eager_rope.rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon)
+
+            try:
+                if orig_ck_rms_rope is not None:
+                    return orig_ck_rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon)
+                return eager_rope.rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon)
+            except Exception:
+                return eager_rope.rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon)
+
+        _safe_rms_rope._hswq_safe_rms_rope = True
+
+        # 3. Safe wrapper for rms_rope1
+        orig_ck_rms_rope1 = getattr(ck, "rms_rope1", None)
+
+        def _safe_rms_rope1(x, freqs_cis, scale, epsilon=1e-6):
+            if scale is not None and (scale.device != x.device or scale.dtype != x.dtype):
+                scale = scale.to(device=x.device, dtype=x.dtype)
+            if freqs_cis is not None and freqs_cis.device != x.device:
+                freqs_cis = freqs_cis.to(device=x.device)
+
+            cur_blackwell = False
+            if x.is_cuda:
+                try:
+                    c = torch.cuda.get_device_capability(x.device)
+                    cur_blackwell = (c[0] >= 10)
+                except Exception:
+                    pass
+
+            if cur_blackwell or is_blackwell:
+                return eager_rope.rms_rope1(x, freqs_cis, scale, epsilon)
+
+            try:
+                if orig_ck_rms_rope1 is not None:
+                    return orig_ck_rms_rope1(x, freqs_cis, scale, epsilon)
+                return eager_rope.rms_rope1(x, freqs_cis, scale, epsilon)
+            except Exception:
+                return eager_rope.rms_rope1(x, freqs_cis, scale, epsilon)
+
+        _safe_rms_rope1._hswq_safe_rms_rope = True
+
+        # 4. Patch comfy_kitchen module root
+        ck.rms_rope = _safe_rms_rope
+        ck.rms_rope1 = _safe_rms_rope1
+        applied.append("comfy_kitchen.rms_rope")
+
+        # 5. Patch comfy.quant_ops.ck
+        try:
+            import comfy.quant_ops as comfy_qo
+            if hasattr(comfy_qo, "ck"):
+                comfy_qo.ck.rms_rope = _safe_rms_rope
+                comfy_qo.ck.rms_rope1 = _safe_rms_rope1
+                applied.append("comfy.quant_ops.ck")
+        except Exception:
+            pass
+
+        # 6. Patch comfy_kitchen.backends.cuda
+        try:
+            import comfy_kitchen.backends.cuda as ck_cuda
+            ck_cuda.rms_rope = _safe_rms_rope
+            ck_cuda.rms_rope1 = _safe_rms_rope1
+            if hasattr(ck_cuda, "_rms_rope_cuda"):
+                ck_cuda._rms_rope_cuda = _safe_rms_rope
+            if hasattr(ck_cuda, "_rms_rope1_cuda"):
+                ck_cuda._rms_rope1_cuda = _safe_rms_rope1
+            applied.append("ck.backends.cuda")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.debug("[HSWQ INT8] comfy_kitchen rms_rope fallback patch error: %s", e)
+
+    # 7. Additional safety guard: patch JointAttention.forward in comfy.ldm.lumina.model
+    # so that if anything fails during execution, it safely falls back to standard eager forward!
+    try:
+        import comfy.ldm.lumina.model as lumina_model
+        JointAttention = getattr(lumina_model, "JointAttention", None)
+        if JointAttention is not None and not getattr(JointAttention, "_hswq_safe_ja_forward", False):
+            orig_ja_forward = JointAttention.forward
+
+            def _safe_ja_forward(self, x, x_mask, freqs_cis, transformer_options={}):
+                try:
+                    return orig_ja_forward(self, x, x_mask, freqs_cis, transformer_options=transformer_options)
+                except Exception as exc:
+                    logger.warning("[HSWQ] JointAttention forward fallback triggered (%s)", exc)
+                    bsz, seqlen, _ = x.shape
+                    xq, xk, xv = torch.split(
+                        self.qkv(x),
+                        [
+                            self.n_local_heads * self.head_dim,
+                            self.n_local_kv_heads * self.head_dim,
+                            self.n_local_kv_heads * self.head_dim,
+                        ],
+                        dim=-1,
+                    )
+                    xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+                    xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+                    xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+                    if self.qk_norm:
+                        xq = self.q_norm(xq)
+                        xk = self.k_norm(xk)
+                    from comfy.ldm.flux.math import apply_rope
+                    xq, xk = apply_rope(xq, xk, freqs_cis)
+                    n_rep = self.n_local_heads // self.n_local_kv_heads
+                    if n_rep > 1:
+                        xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+                        xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+                    from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention_masked
+                    xq_c = AttentionTensorContainer(xq.movedim(1, 2))
+                    xk_c = AttentionTensorContainer(xk.movedim(1, 2))
+                    xv_c = AttentionTensorContainer(xv.movedim(1, 2))
+                    preferred_attn = getattr(self, "comfy_attention", None)
+                    output = optimized_attention_masked(
+                        xq_c, xk_c, xv_c, self.n_local_heads, x_mask,
+                        skip_reshape=True, transformer_options=transformer_options,
+                        preferred_attention=preferred_attn,
+                    )
+                    return self.out(output)
+
+            _safe_ja_forward._hswq_safe_ja_forward = True
+            JointAttention.forward = _safe_ja_forward
+            applied.append("JointAttention.forward guard")
+    except Exception as e:
+        logger.debug("[HSWQ INT8] JointAttention patch error: %s", e)
+
+    if applied:
+        _COMFY_KITCHEN_RMS_ROPE_FALLBACK_PATCHED = True
+        logger.info("[HSWQ INT8] comfy_kitchen rms_rope Blackwell/eager fallback patch armed (%s)", ", ".join(applied))
+        return True
+    return False
+
+
+def _regular_hadamard_global(size: int, device=None):
+    import torch
+    h4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        dtype=torch.float32,
+        device=device,
+    )
+    h = h4
+    while h.shape[0] < size:
+        h = torch.kron(h, h4)
+    return h / (size ** 0.5)
+
+
 def _patch_controllora_int8_dequant() -> bool:
     """Dequantize borrowed base-UNet quantized weights in ControlLora.pre_run.
 
@@ -2174,7 +2790,7 @@ def _patch_controllora_int8_dequant() -> bool:
     if ControlLora is None:
         return False
     original = getattr(ControlLora, "pre_run", None)
-    _CL_VER = 2
+    _CL_VER = 3
     if original is None or getattr(original, "_hswq_int8_controllora_ver", 0) >= _CL_VER:
         return getattr(original, "_hswq_int8_controllora", False)
     true_orig = getattr(original, "_hswq_orig_controllora_pre_run", original)
@@ -2189,13 +2805,111 @@ def _patch_controllora_int8_dequant() -> bool:
         (which caused ``RecursionError: maximum recursion depth exceeded``)."""
         full = orig_sd()
 
-        # Collect the state-dict prefix of every quantized weight.
+        # Collect the state-dict prefix of every quantized weight, together
+        # with its module (needed to detect HSWQ-armed Conv2d ConvRot).
         quant_weight_keys = {}
         for name, module in diffusion_model.named_modules():
             w = getattr(module, "weight", None)
             if isinstance(w, QuantizedTensor):
                 key = (name + "." if name else "") + "weight"
-                quant_weight_keys[key] = w
+                quant_weight_keys[key] = (w, module)
+
+        import torch as _torch
+
+        def _regular_hadamard(size, device=None):
+            h4 = _torch.tensor(
+                [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+                dtype=_torch.float32,
+                device=device,
+            )
+            h = h4
+            while h.shape[0] < size:
+                h = _torch.kron(h, h4)
+            return h / (size ** 0.5)
+
+        def _unrotate_conv2d(w, gs):
+            """Inverse of rotate_weight_conv2d (per-(o,kh,kw) in-channel rows)."""
+            o, i, kh, kw = w.shape
+            if i % gs != 0 or i // gs <= 0:
+                return w
+            h = _regular_hadamard(gs, w.device)
+            flat = w.float().permute(0, 2, 3, 1).contiguous().view(-1, i)
+            flat = (flat.view(-1, i // gs, gs) @ h).view(-1, i)
+            return flat.view(o, kh, kw, i).permute(0, 3, 1, 2).contiguous()
+
+        def _manual_qt_dequant(qt):
+            """Dequantize a QuantizedTensor, incl. 4D Conv2d ConvRot.
+
+            comfy-kitchen's ``dequantize_int8_convrot_weight_dtype`` only
+            accepts 2D (Linear); for Conv2d (4D) it raises
+            NoCapableBackendError, which the old wrapper swallowed and fell
+            back to the RAW qdata (absmax ~127) - poisoning the float
+            ControlLoraOps control model. Rebuild manually instead:
+            W_rot = qdata * scale, then un-rotate along in_channels per
+            (o, kh, kw) row (mirrors native_convert_int8.rotate_weight_conv2d).
+            """
+            p = qt._params
+            qd = qt._qdata
+            w = qd.float() * p.scale.float()
+            gs = int(getattr(p, "convrot_groupsize", 0) or 0)
+            if getattr(p, "convrot", False) and gs >= 4:
+                if w.ndim == 2:
+                    o, i = w.shape
+                    if i % gs == 0 and i // gs > 0:
+                        h = _regular_hadamard(gs)
+                        w = (w.view(o, i // gs, gs) @ h).view(o, i)
+                elif w.ndim == 4:
+                    w = _unrotate_conv2d(w, gs)
+            orig = getattr(p, "orig_shape", None)
+            if orig is not None and tuple(w.shape) != tuple(orig):
+                w = w.reshape(orig)
+            return w.to(qd.dtype if qd.is_floating_point() else _torch.float16)
+
+        # Fallback: layers whose comfy_quant was NOT consumed at load time
+        # (stock ComfyUI leaves e.g. Conv2d int8_tensorwise as raw int8 qdata
+        # reinterpreted as float, absmax ~127; no QuantizedTensor attached).
+        # Dequantize them here from the sidecar keys; QuantizedTensor modules
+        # above are already covered by the qt.dequantize() path.
+        raw_weights = {}
+        raw_sidecar_drop = set()
+        for key in list(full.keys()):
+            if not key.endswith(".comfy_quant"):
+                continue
+            base = key[: -len("comfy_quant")]
+            wkey = base + "weight"
+            if wkey in quant_weight_keys or wkey not in full:
+                continue
+            try:
+                conf = json.loads(full[key].numpy().tobytes())
+            except Exception:  # noqa: BLE001
+                continue
+            if conf.get("format") != "int8_tensorwise":
+                continue
+            scale = full.get(base + "weight_scale")
+            if scale is None:
+                continue
+            q = full[wkey]
+            is_raw = q.dtype in (_torch.int8, _torch.uint8) or (
+                q.is_floating_point()
+                and bool(_torch.isfinite(q).all())
+                and float(q.abs().max()) <= 127.5
+            )
+            if not is_raw:
+                continue
+            w = q.float() * scale.float()
+            convrot = bool(conf.get("convrot", False))
+            gs = int(conf.get("convrot_groupsize", 0) or 0)
+            if convrot and gs >= 4:
+                if w.ndim == 2:
+                    o, i = w.shape
+                    if i % gs == 0 and i // gs > 0:
+                        h = _regular_hadamard(gs)
+                        w = (w.view(o, i // gs, gs) @ h).view(o, i)
+                elif w.ndim == 4:
+                    w = _unrotate_conv2d(w, gs)
+            raw_weights[wkey] = w.to(_torch.float16)
+            raw_sidecar_drop.add(base + "weight_scale")
+            raw_sidecar_drop.add(key)
 
         out = {}
         n_dequant = 0
@@ -2203,18 +2917,39 @@ def _patch_controllora_int8_dequant() -> bool:
         for k, v in full.items():
             replaced = False
             dropped = False
-            for wk, qt in quant_weight_keys.items():
+            for wk, (qt, mod) in quant_weight_keys.items():
                 if k == wk:
                     # raw int8 qdata -> real float weight
                     try:
-                        out[k] = qt.dequantize()
-                        n_dequant += 1
+                        wgt = qt.dequantize()
                     except Exception as e:  # noqa: BLE001
-                        logger.warning(
-                            "[HSWQ INT8] ControlLora: dequantize failed for %s: %s",
-                            k, e,
-                        )
-                        out[k] = v
+                        # kitchen dequantize() is 2D-only (Conv2d ConvRot
+                        # raises NoCapableBackendError); never inject raw
+                        # qdata - rebuild the float weight manually.
+                        try:
+                            wgt = _manual_qt_dequant(qt)
+                        except Exception as e2:  # noqa: BLE001
+                            logger.warning(
+                                "[HSWQ INT8] ControlLora: dequantize failed for %s (%s; manual %s)",
+                                k, e, e2,
+                            )
+                            wgt = v
+                    # HSWQ-armed Conv2d ConvRot: params.convrot is CLEARED and
+                    # weights stay in the ROTATED basis (forward rotates NCHW
+                    # activations online). Plain dequantize() therefore returns
+                    # W_rot; the float ControlLoraOps control model does NOT
+                    # rotate activations, so un-rotate back to W here.
+                    if (
+                        mod is not None
+                        and getattr(mod, "_hswq_convrot", False)
+                        and getattr(qt, "_qdata", None) is not None
+                        and qt._qdata.ndim == 4
+                    ):
+                        gs = int(getattr(mod, "_hswq_convrot_groupsize", 0) or 0)
+                        if gs >= 4:
+                            wgt = _unrotate_conv2d(wgt, gs)
+                    out[k] = wgt
+                    n_dequant += 1
                     replaced = True
                     break
                 base = wk[: -len("weight")]  # "X."
@@ -2225,6 +2960,13 @@ def _patch_controllora_int8_dequant() -> bool:
                 ):
                     dropped = True
                     break
+            if not replaced and not dropped and k in raw_weights:
+                out[k] = raw_weights[k]
+                n_dequant += 1
+                continue
+            if not replaced and not dropped and k in raw_sidecar_drop:
+                n_drop += 1
+                continue
             if replaced:
                 continue
             if dropped:
@@ -2233,13 +2975,14 @@ def _patch_controllora_int8_dequant() -> bool:
             out[k] = v
 
         print(
-            f"[HSWQ INT8][ControlLora] dequantized state_dict: "
-            f"weights dequantized(int8->float)={n_dequant}, "
-            f"sidecar keys dropped(scale/comfy_quant/input_scale)={n_drop}, "
-            f"total keys out={len(out)}",
+            "[HSWQ INT8][ControlLora] dequantized state_dict: "
+            "weights dequantized(int8->float)=%d, sidecars dropped=%d, "
+            "total keys out=%d" % (n_dequant, n_drop, len(out)),
             flush=True,
         )
         return out
+
+
 
     def pre_run(self, model, percent_to_timestep_function):
         diffusion_model = getattr(model, "diffusion_model", None)
@@ -2303,9 +3046,283 @@ def _patch_controllora_int8_dequant() -> bool:
     return True
 
 
+_SAM3_PROCESS_STATE_DICT_PATCHED = False
+
+
+def _patch_sam3_process_state_dict() -> bool:
+    """Fix ComfyUI SAM3 / SAM31 process_unet_state_dict to preserve and slice
+    weight_scale and .comfy_quant sidecars when in_proj_weight is split into
+    q_proj, k_proj, v_proj. Also split in_proj_weight in _clip_stash for CLIP.
+    """
+    global _SAM3_PROCESS_STATE_DICT_PATCHED
+    if _SAM3_PROCESS_STATE_DICT_PATCHED:
+        return True
+
+    try:
+        import comfy.supported_models as sm
+        sam3_cls = getattr(sm, "SAM3", None)
+        if sam3_cls is None:
+            return False
+
+        orig_process = getattr(sam3_cls, "process_unet_state_dict", None)
+        orig_process_clip = getattr(sam3_cls, "process_clip_state_dict", None)
+        if orig_process is None or orig_process_clip is None or getattr(orig_process, "_hswq_patched", False):
+            _SAM3_PROCESS_STATE_DICT_PATCHED = True
+            return True
+
+        def _safe_process_unet_state_dict(self, state_dict):
+            # HSWQ: keep stock behavior. Pre-splitting in_proj_weight (or its
+            # weight_scale / .comfy_quant sidecars) before ComfyUI's
+            # clip_text_transformers_convert() breaks the CLIP key remap:
+            # transformers_convert() expects the fused in_proj_weight form to
+            # produce "sam3_clip.transformer.text_model.encoder.layers.N.
+            # self_attn.q_proj" keys. Pre-split keys are left un-remapped, so the
+            # CLIP loads with missing weights ("clip missing") and corrupts text
+            # embeddings -> noisy SAM3 masks. Stock path handles everything.
+            return orig_process(self, state_dict)
+
+        _CLIP_SIMPLE_REMAP = {
+            "encoder.positional_embedding": "sam3_clip.transformer.text_model.embeddings.position_embedding.weight",
+            "encoder.token_embedding.weight": "sam3_clip.transformer.text_model.embeddings.token_embedding.weight",
+            "encoder.ln_final.weight": "sam3_clip.transformer.text_model.final_layer_norm.weight",
+            "encoder.ln_final.bias": "sam3_clip.transformer.text_model.final_layer_norm.bias",
+            "encoder.text_projection.weight": "sam3_clip.transformer.text_projection.weight",
+            "encoder.text_projection": "sam3_clip.transformer.text_projection.weight",
+        }
+
+        def _safe_process_clip_state_dict(self, state_dict):
+            clip_sd = orig_process_clip(self, state_dict)
+            # INT8 SAM3 checkpoints store language_backbone already split into
+            # q_proj/k_proj/v_proj (no fused in_proj_weight), so ComfyUI's
+            # transformers_convert() leaves those keys un-remapped
+            # ("clip missing" -> corrupt text embeddings -> noisy masks).
+            # Remap leftover "encoder.*" keys to the expected CLIP layout.
+            out = {}
+            for k, v in clip_sd.items():
+                nk = k
+                if nk.startswith("encoder.transformer.resblocks."):
+                    nk = nk.replace("encoder.transformer.resblocks.", "sam3_clip.transformer.text_model.encoder.layers.", 1)
+                    nk = nk.replace(".attn.", ".self_attn.")
+                    nk = nk.replace(".mlp.c_fc.", ".mlp.fc1.")
+                    nk = nk.replace(".mlp.c_proj.", ".mlp.fc2.")
+                    nk = nk.replace(".ln_1.", ".layer_norm1.")
+                    nk = nk.replace(".ln_2.", ".layer_norm2.")
+                elif nk in _CLIP_SIMPLE_REMAP:
+                    nk = _CLIP_SIMPLE_REMAP[nk]
+                out[nk] = v
+            return out
+
+        _safe_process_unet_state_dict._hswq_patched = True
+        _safe_process_clip_state_dict._hswq_patched = True
+        sam3_cls.process_unet_state_dict = _safe_process_unet_state_dict
+        sam3_cls.process_clip_state_dict = _safe_process_clip_state_dict
+        _SAM3_PROCESS_STATE_DICT_PATCHED = True
+        logger.info("[HSWQ INT8] SAM3 process_state_dict patch armed (CLIP remap for pre-split INT8 checkpoints)")
+        return True
+    except Exception as e:
+        logger.debug("[HSWQ INT8] SAM3 process_state_dict patch skipped: %s", e)
+        return False
+
+
+def _dequant_and_unrotate_tensor(q, scale, raw_conf):
+    import torch
+    try:
+        conf = json.loads(raw_conf.numpy().tobytes()) if hasattr(raw_conf, "numpy") else {}
+    except Exception:
+        conf = {}
+    if scale is None:
+        w_float = q.float()
+    elif isinstance(scale, torch.Tensor):
+        if scale.ndim == 1 and q.ndim == 2 and scale.shape[0] == q.shape[0]:
+            w_float = q.float() * scale.float().unsqueeze(1)
+        elif scale.ndim == 2 and q.ndim == 2 and scale.shape[0] == q.shape[0]:
+            w_float = q.float() * scale.float()
+        elif scale.numel() == 1:
+            w_float = q.float() * scale.item()
+        else:
+            try:
+                w_float = q.float() * scale.float()
+            except Exception:
+                w_float = q.float() * scale.float().view(-1, 1)
+    else:
+        w_float = q.float() * float(scale)
+
+    has_convrot = isinstance(conf, dict) and conf.get("convrot", False)
+    gs = int(conf.get("convrot_groupsize", 256) or 256) if has_convrot else 0
+
+    if has_convrot and gs >= 4:
+        if w_float.ndim == 2:
+            o, i = w_float.shape
+            for cand_gs in (gs, 256, 64, 16, 4):
+                if i % cand_gs == 0 and i // cand_gs > 0:
+                    h = _regular_hadamard_global(cand_gs, device=w_float.device)
+                    group_count = i // cand_gs
+                    w_grouped = w_float.view(o, group_count, cand_gs)
+                    w_float = torch.matmul(w_grouped, h.to(dtype=w_float.dtype, device=w_float.device)).reshape(o, i)
+                    break
+        elif w_float.ndim == 4:
+            o, i, kh, kw = w_float.shape
+            for cand_gs in (gs, 256, 64, 16, 4):
+                if i % cand_gs == 0 and i // cand_gs > 0:
+                    h = _regular_hadamard_global(cand_gs, device=w_float.device)
+                    flat = w_float.permute(0, 2, 3, 1).contiguous().view(-1, i)
+                    group_count = i // cand_gs
+                    flat_grouped = flat.view(-1, group_count, cand_gs)
+                    flat_un = torch.matmul(flat_grouped, h.to(dtype=flat.dtype, device=flat.device)).reshape(-1, i)
+                    w_float = flat_un.view(o, kh, kw, i).permute(0, 3, 1, 2).contiguous()
+                    break
+    return w_float.to(torch.float16)
+
+
+_CHECKPOINT_LOADER_INT8_PATCHED = False
+
+
+def _patch_load_state_dict_guess_config_int8() -> bool:
+    """Patch comfy.sd.load_state_dict_guess_config so that SAM3 checkpoints
+    with .comfy_quant INT8 layers automatically attach MixedPrecisionOps with
+    INT8 tensorwise algorithm, while dequantizing text encoder (CLIP) keys.
+    """
+    global _CHECKPOINT_LOADER_INT8_PATCHED
+    if _CHECKPOINT_LOADER_INT8_PATCHED:
+        return True
+
+    try:
+        import comfy.sd
+        import comfy.ops as comfy_ops
+        from comfy.quant_ops import QUANT_ALGOS
+
+        orig_fn = getattr(comfy.sd, "load_state_dict_guess_config", None)
+        if orig_fn is None or getattr(orig_fn, "_hswq_patched", False):
+            _CHECKPOINT_LOADER_INT8_PATCHED = True
+            return True
+
+        def _safe_load_state_dict_guess_config(
+            sd,
+            output_vae=True,
+            output_clip=True,
+            output_clipvision=False,
+            embedding_directory=None,
+            output_model=True,
+            model_options={},
+            te_model_options={},
+            metadata=None,
+            disable_dynamic=False,
+        ):
+            # Arm sub-patches first
+            apply_comfy_quant_int8_patches()
+
+            # Strict SAM3 gate: NEVER affect SDXL, Krea2, ZImage, FLUX, SD1.5, SD3, Wan, etc.
+            is_sam3 = any(k.startswith("detector.") or "detector.backbone.vision_backbone" in k for k in sd.keys())
+            if not is_sam3:
+                return orig_fn(
+                    sd,
+                    output_vae=output_vae,
+                    output_clip=output_clip,
+                    output_clipvision=output_clipvision,
+                    embedding_directory=embedding_directory,
+                    output_model=output_model,
+                    model_options=model_options,
+                    te_model_options=te_model_options,
+                    metadata=metadata,
+                    disable_dynamic=disable_dynamic,
+                )
+
+            model_options = dict(model_options) if model_options else {}
+            te_model_options = dict(te_model_options) if te_model_options else {}
+
+            # 1. Check if SAM3 checkpoint carries INT8 comfy_quant layers
+            has_int8 = any(k.endswith(".comfy_quant") for k in sd.keys())
+
+            # 2. Pre-split and dequantize language_backbone (CLIP Text Encode) and Conv2d keys in sd
+            if has_int8:
+                dequant_count = 0
+                for quant_key in list(sd.keys()):
+                    if not quant_key.endswith(".comfy_quant"):
+                        continue
+                    base = quant_key[:-len(".comfy_quant")]
+                    w_key = base + "weight" if base.endswith(".") else base + ".weight"
+                    if w_key not in sd:
+                        w_key = base
+                    q = sd.get(w_key)
+                    if q is None:
+                        continue
+
+                    # Only dequantize 4D Conv2d and text encoder keys; keep ALL Linear layers in INT8!
+                    is_conv = getattr(q, "ndim", 0) == 4
+                    is_text = "language_backbone" in quant_key
+                    if is_conv or is_text:
+                        candidates = [
+                            base + "weight_scale" if base.endswith(".") else base + ".weight_scale",
+                            base + "scale" if base.endswith(".") else base + ".scale",
+                            base[:-1] + "_scale" if base.endswith(".") else base + "_scale",
+                        ]
+                        scale_key = next((c for c in candidates if c in sd), None)
+                        scale = sd.get(scale_key) if scale_key else None
+                        raw_conf = sd.get(quant_key)
+
+                        w_clean = _dequant_and_unrotate_tensor(q, scale, raw_conf)
+                        sd[w_key] = w_clean
+                        if scale_key:
+                            sd.pop(scale_key, None)
+                        sd.pop(quant_key, None)
+                        dequant_count += 1
+
+                logger.info(
+                    "[HSWQ INT8] Load Checkpoint: Dequantized %d Conv2d/CLIP keys; ALL Linear layers stay true INT8 in VRAM",
+                    dequant_count,
+                )
+
+            # (removed) sd-level in_proj_weight pre-split: it breaks ComfyUI's
+            # clip_text_transformers_convert() remap -> "clip missing" -> corrupt
+            # text embeddings -> noisy SAM3 masks. The stock process_unet_state_dict
+            # / transformers_convert split in_proj_weight correctly.
+
+            # 4. Attach MixedPrecisionOps for SAM3 so all Linear layers (ViT trunk, transformer) load as true INT8 in VRAM
+            if has_int8:
+                quant_config = {
+                    "int8_tensorwise": QUANT_ALGOS["int8_tensorwise"],
+                }
+                sam3_ops = comfy_ops.mixed_precision_ops(
+                    quant_config,
+                    torch.bfloat16,
+                    full_precision_mm=False,
+                    disabled=[],
+                )
+                model_options["custom_operations"] = sam3_ops
+                model_options["dtype"] = torch.bfloat16
+                logger.info(
+                    "[HSWQ INT8] Load Checkpoint: Auto-attached MixedPrecisionOps for SAM3 INT8 comfy_quant (525MB VRAM)"
+                )
+
+            out = orig_fn(
+                sd,
+                output_vae=output_vae,
+                output_clip=output_clip,
+                output_clipvision=output_clipvision,
+                embedding_directory=embedding_directory,
+                output_model=output_model,
+                model_options=model_options,
+                te_model_options=te_model_options,
+                metadata=metadata,
+                disable_dynamic=disable_dynamic,
+            )
+            return out
+
+        _safe_load_state_dict_guess_config._hswq_patched = True
+        comfy.sd.load_state_dict_guess_config = _safe_load_state_dict_guess_config
+        _CHECKPOINT_LOADER_INT8_PATCHED = True
+        logger.info("[HSWQ INT8] CheckpointLoader INT8 auto-attach & CLIP dequant patch armed")
+        return True
+    except Exception as e:
+        logger.debug("[HSWQ INT8] load_state_dict_guess_config patch failed: %s", e)
+        return False
+
+
 def apply_comfy_quant_int8_patches() -> bool:
     """Install INT8 comfy_quant patches once. Returns True if applied (or already applied)."""
     global _PATCHES_APPLIED
+    _patch_comfy_kitchen_rms_rope_fallback()
+    _patch_comfy_kitchen_int8_gemm_fallback()
     ok_keys = _patch_load_lora_key_counts()
     ok_name = _patch_lora_loader_name_context()
     ok_path = _patch_loras_folder_path_name()
@@ -2344,6 +3361,65 @@ def apply_comfy_quant_int8_patches() -> bool:
 
 
 KREA2_MODEL_FLAG = "_hswq_is_krea2"
+
+
+_SDXL_FAST_MOD = None
+_SDXL_CLIP_QUANT_MOD = None
+
+
+def _load_sdxl_convrot_fast():
+    """Load the SDXL-only fast-path file by path WITHOUT registering it in
+    sys.modules, so no other model family ever sees it as an import.
+    Called only from the SDXL-guarded branches below."""
+    global _SDXL_FAST_MOD
+    if _SDXL_FAST_MOD is None:
+        import importlib.util
+        import os as _os
+
+        repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        path = _os.path.join(repo, "nodes", "sdxl_convrot_int8", "sdxl_convrot_fast.py")
+        spec = importlib.util.spec_from_file_location(
+            "_hswq_sdxl_convrot_fast_private", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.set_helpers_loader(_load_native_convert_int8_helpers)
+        _SDXL_FAST_MOD = mod
+    return _SDXL_FAST_MOD
+
+
+def _load_sdxl_clip_quant():
+    """Load the SDXL-only CLIP INT8 metadata module by path WITHOUT registering it
+    in sys.modules, so no other model family ever sees it as an import.
+    Called only from the SDXL-guarded branch below."""
+    global _SDXL_CLIP_QUANT_MOD
+    if _SDXL_CLIP_QUANT_MOD is None:
+        import importlib.util
+        import os as _os
+
+        repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        path = _os.path.join(repo, "nodes", "sdxl_convrot_int8", "sdxl_clip_quant.py")
+        spec = importlib.util.spec_from_file_location(
+            "_hswq_sdxl_clip_quant_private", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _SDXL_CLIP_QUANT_MOD = mod
+    return _SDXL_CLIP_QUANT_MOD
+
+
+def _model_is_sdxl_unet(model) -> bool:
+    """True only for the SDXL UNet (UNetModel from openaimodel with ADM).
+
+    Used to gate SDXL-only code paths; no side effects.
+    """
+    inner = getattr(model, "model", None)
+    dm = getattr(inner, "diffusion_model", None)
+    if dm is None:
+        return False
+    if type(dm).__name__ != "UNetModel":
+        return False
+    if "openaimodel" not in type(dm).__module__.lower():
+        return False
+    return getattr(dm, "adm_in_channels", None) is not None
 
 
 def model_is_krea2(model) -> bool:
@@ -2388,7 +3464,7 @@ def tag_krea2_model(model) -> bool:
     return True
 
 
-def load_unet_hswq_weight_dtype(unet_name, weight_dtype):
+def load_unet_hswq_weight_dtype(unet_name, weight_dtype, hswq_bake=True, **kwargs):
     import logging
     import torch
     import folder_paths
@@ -2409,17 +3485,69 @@ def load_unet_hswq_weight_dtype(unet_name, weight_dtype):
         # Krea2 does not need or want Z Image parity - it uses stock MixedPrecision -
         # but the leftover wrapper makes forward_parity fire Hadamard rotations every
         # step, causing progressive slowdown (4s/step -> 16s -> 22s -> 26s across runs).
-        try:
-            from ..nodes.nvfp4.comfy_quant_nvfp4 import (
-                _clear_zimage_parity_contamination_for_sdxl,
+        # UI toggle: hswq_bake ON = HSWQ path (HSWQ patches).
+        # OFF = stock ComfyUI path (DynamicVRAM / shared VRAM, no HSWQ patches).
+        _aimdo_dynamic = not bool(hswq_bake)
+        if _aimdo_dynamic:
+            # DynamicVRAM (comfy-aimdo): run the stock ComfyUI path exactly like
+            # upstream ComfyUI-MultiGPU. HSWQ parity/mp-stack/LoRA-bake are skipped
+            # (they fight the mmap/vbar representation; measured 2x slowdown).
+            logging.info(
+                "[HSWQ INT8] Krea2 ConvRot INT8: DynamicVRAM (comfy-aimdo) active -> "
+                "stock path (HSWQ parity/mp-stack/LoRA-bake skipped, upstream parity)"
             )
+        else:
+            try:
+                from ..nodes.sdxl_convrot_nvfp4.comfy_quant_nvfp4 import (
+                    _clear_zimage_parity_contamination_for_sdxl,
+                )
 
-            _clear_zimage_parity_contamination_for_sdxl()
-        except Exception as e:
-            logging.warning(
-                "[HSWQ INT8] clear Z Image NVFP4 contamination for Krea2 failed: %s", e
-            )
+                _clear_zimage_parity_contamination_for_sdxl()
+            except Exception as e:
+                logging.warning(
+                    "[HSWQ INT8] clear Z Image NVFP4 contamination for Krea2 failed: %s", e
+                )
         model_options = {}
+        # Krea2 ConvRot INT8 needs the SAME low-rank residual LoRA bake +
+        # forward as Krea2 ConvRot NVFP4 (INT8 8-bit requant rounds away small
+        # style-LoRA deltas just like 4-bit). Gate on the Krea2 txtfusion
+        # projector only - never other DiT (FLUX), SDXL, or Z Image ConvRot INT8.
+        is_krea2 = checkpoint_is_krea2(unet_path)
+        krea2_bake_ok = False
+        if is_krea2 and not _aimdo_dynamic:
+            try:
+                from ..nodes.krea2_convrot_int8.comfy_quant_int8_krea2 import (
+                    apply_comfy_quant_int8_patches,
+                )
+                from ..nodes.krea2_convrot_int8.int8_lora_bake import (
+                    install_krea2_int8_lora_bake,
+                    reset_krea2_int8_lora_bake_log_counters,
+                )
+                from ..nodes.krea2_convrot_int8.int8_forward import (
+                    reset_int8_forward_stats,
+                )
+
+                if apply_comfy_quant_int8_patches():
+                    krea2_bake_ok = install_krea2_int8_lora_bake(force=True)
+                reset_int8_forward_stats()
+                reset_krea2_int8_lora_bake_log_counters()
+                if krea2_bake_ok:
+                    logging.info(
+                        "[HSWQ INT8] Krea2 ConvRot INT8 residual LoRA bake+forward "
+                        "installed: %s",
+                        unet_name,
+                    )
+                else:
+                    logging.warning(
+                        "[HSWQ INT8] Krea2 ConvRot INT8 residual LoRA install "
+                        "failed; LoRA stays stock (requant): %s",
+                        unet_name,
+                    )
+            except Exception as e:
+                logging.warning(
+                    "[HSWQ INT8] Krea2 ConvRot INT8 LoRA install failed: %s", e
+                )
+
         logging.info(
             "[HSWQ INT8] DiT/Krea2 ConvRot — stock-equivalent load "
             "(no INT8 Conv2d patches): %s",
@@ -2430,6 +3558,23 @@ def load_unet_hswq_weight_dtype(unet_name, weight_dtype):
             flush=True,
         )
         model = comfy.sd.load_diffusion_model(unet_path, model_options=model_options)
+        # Stamp the HSWQ-path choice so the Dynamic.load bake hooks (built at
+        # import time) can be skipped on the stock path.
+        try:
+            _bk = bool(hswq_bake)
+            setattr(model, "_hswq_bake_enabled", _bk)
+            if getattr(model, "model", None) is not None:
+                setattr(model.model, "_hswq_bake_enabled", _bk)
+        except Exception:
+            pass
+        if krea2_bake_ok:
+            # Stamp for the Krea2 bake hook (mirrors the NVFP4 loader stamp; the
+            # inner-model stamp survives ModelPatcher clones made by LoRA nodes).
+            model._hswq_krea2_int8_pack = True
+            inner_model = getattr(model, "model", None)
+            if inner_model is not None:
+                inner_model._hswq_krea2_int8_pack = True
+
     elif is_int8:
         apply_comfy_quant_int8_patches()
         model_options = {}
@@ -2452,6 +3597,23 @@ def load_unet_hswq_weight_dtype(unet_name, weight_dtype):
         with _int8_quant_conv_scope():
             model = comfy.sd.load_diffusion_model(unet_path, model_options=model_options)
         summarize_int8_lora_capability(model)
+        # SDXL-only fast path: dedicated module + dedicated guard.
+        # This branch also serves Z Image (UNet-style checkpoints), so the SDXL
+        # check runs BEFORE the import: non-SDXL never imports the module.
+        if is_convrot and needs_conv2d and _model_is_sdxl_unet(model):
+            # Graph-first (measured: bit-equal replay 1.23-1.40x at 1024); the
+            # pooled-rotate eager path only arms when the graph arm fails.
+            try:
+                if not _load_sdxl_convrot_fast()._arm_sdxl_cudagraph(model):
+                    logger.warning(
+                        "[HSWQ INT8][SDXL graph] arm failed (unet branch); fallback to pooled-rotate eager path"
+                    )
+                    _load_sdxl_convrot_fast().arm_sdxl_convrot_fast(model)
+            except Exception as e:
+                logger.warning(
+                    "[HSWQ INT8][SDXL graph] arm exception (%s); fallback to pooled-rotate eager path", e
+                )
+                _load_sdxl_convrot_fast().arm_sdxl_convrot_fast(model)
     else:
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
@@ -2487,13 +3649,18 @@ def load_checkpoint_sdxl_hswq_weight_dtype(ckpt_name, weight_dtype, device=None)
         # INT8 Conv2d + comfy_quant decode only when checkpoint is INT8.
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
         # Auto-detect native comfy_quant INT8; do not force float8 dtype over int8 weights.
-        is_int8 = weight_dtype == "int8_tensorwise" or checkpoint_looks_like_comfy_quant_int8(ckpt_path)
+        # SDXL loader passes its own marker ("SDXL ConvRot INT8"); also accept the
+        # raw "int8_tensorwise" for backward compatibility with saved workflows.
+        is_int8 = (
+            weight_dtype in ("SDXL ConvRot INT8", "int8_tensorwise")
+            or checkpoint_looks_like_comfy_quant_int8(ckpt_path)
+        )
 
         model_options = {}
         if is_int8:
             # Z Image comfy_parity + ZI Dynamic bake must not wrap SDXL INT8.
             try:
-                from ..nodes.nvfp4.comfy_quant_nvfp4 import (
+                from ..nodes.sdxl_convrot_nvfp4.comfy_quant_nvfp4 import (
                     _clear_zimage_parity_contamination_for_sdxl,
                 )
 
@@ -2504,6 +3671,16 @@ def load_checkpoint_sdxl_hswq_weight_dtype(ckpt_name, weight_dtype, device=None)
                 )
             apply_comfy_quant_int8_patches()
             reset_int8_lora_log_counters()
+            # SDXL-only: make the embedded CLIP consume its ConvRot INT8 metadata
+            # (clip_l + clip_g). Without this the CLIP int8 weights load as fp16
+            # and conditioning collapses. Loaded by path; never imported by other
+            # families.
+            try:
+                _load_sdxl_clip_quant().arm_sdxl_clip_quant_metadata()
+            except Exception as e:
+                sdxl_logger.warning(
+                    "[SDXL INT8] CLIP quant metadata arm failed: %s", e
+                )
             sdxl_logger.info(
                 "[SDXL INT8] Loading checkpoint via MixedPrecisionOps "
                 "(int8_tensorwise / comfy_quant): %s",
@@ -2519,6 +3696,22 @@ def load_checkpoint_sdxl_hswq_weight_dtype(ckpt_name, weight_dtype, device=None)
                 )
             model, clip, _v = out[:3]
             summarize_int8_lora_capability(model)
+            if _model_is_sdxl_unet(model):
+                try:
+                    if not _load_sdxl_convrot_fast()._arm_sdxl_cudagraph(model):
+                        logger.warning(
+                            "[HSWQ INT8][SDXL graph] arm failed (ckpt branch); fallback to pooled-rotate eager path"
+                        )
+                        _load_sdxl_convrot_fast().arm_sdxl_convrot_fast(
+                            model, log_prefix="[SDXL INT8]"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "[HSWQ INT8][SDXL graph] arm exception (%s); fallback to pooled-rotate eager path", e
+                    )
+                    _load_sdxl_convrot_fast().arm_sdxl_convrot_fast(
+                        model, log_prefix="[SDXL INT8]"
+                    )
             return (model, clip)
 
         if weight_dtype == "fp8_e4m3fn":
@@ -2546,7 +3739,10 @@ def install_int8_option_dispatch(node_class_mappings) -> bool:
     if not isinstance(node_class_mappings, dict):
         return False
 
-    # Do NOT apply INT8 patches at node registration / import.
+    # Always arm kitchen safety fallbacks (GEMM + Blackwell rms_rope) to prevent C++ aborts.
+    _patch_comfy_kitchen_rms_rope_fallback()
+    _patch_comfy_kitchen_int8_gemm_fallback()
+
     # Patches install only inside load_unet_hswq_weight_dtype /
     # load_checkpoint_sdxl_hswq_weight_dtype when INT8 is actually loaded.
 
@@ -2556,30 +3752,41 @@ def install_int8_option_dispatch(node_class_mappings) -> bool:
     if unet_cls is not None:
         _orig_load_unet = unet_cls.load_unet
 
-        def load_unet(self, unet_name, weight_dtype):
+        def load_unet(self, unet_name, weight_dtype, **kwargs):
+            # Pass through any loader options (e.g. attention_accel) unchanged.
             # Explicit FP8 choices stay on the original FP loader body — never INT8 helper.
             if weight_dtype in _FP8_WEIGHT_DTYPES:
-                return _orig_load_unet(self, unet_name, weight_dtype)
+                return _orig_load_unet(self, unet_name, weight_dtype, **kwargs)
+            # Explicit NVFP4 dtype strings belong to the NVFP4 dispatches
+            # (Z Image / Krea2) wrapped beneath us - never the INT8 helper.
+            if weight_dtype == "Z Image ConvRot NVFP4" or weight_dtype == "Krea2 ConvRot NVFP4":
+                return _orig_load_unet(self, unet_name, weight_dtype, **kwargs)
             if weight_dtype == "int8_tensorwise":
-                return load_unet_hswq_weight_dtype(unet_name, weight_dtype)
+                return load_unet_hswq_weight_dtype(
+                    unet_name, weight_dtype,
+                    hswq_bake=kwargs.get("hswq_bake", True),
+                )
             # default: auto-detect INT8 checkpoints only; otherwise original FP path.
             import folder_paths
 
             unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
             if checkpoint_looks_like_comfy_quant_int8(unet_path):
-                return load_unet_hswq_weight_dtype(unet_name, weight_dtype)
-            return _orig_load_unet(self, unet_name, weight_dtype)
+                return load_unet_hswq_weight_dtype(
+                    unet_name, weight_dtype,
+                    hswq_bake=kwargs.get("hswq_bake", True),
+                )
+            return _orig_load_unet(self, unet_name, weight_dtype, **kwargs)
 
         unet_cls.load_unet = load_unet
 
-    sdxl_cls = node_class_mappings.get("HSWQCheckpointLoaderSDXL")
+    sdxl_cls = node_class_mappings.get("HSWQCheckpointLoader")
     if sdxl_cls is not None:
         _orig_load_checkpoint = sdxl_cls.load_checkpoint
 
         def load_checkpoint(self, ckpt_name, weight_dtype, device=None, **kwargs):
             if weight_dtype in _FP8_WEIGHT_DTYPES:
                 return _orig_load_checkpoint(self, ckpt_name, weight_dtype, device=device, **kwargs)
-            if weight_dtype == "int8_tensorwise":
+            if weight_dtype == "SDXL ConvRot INT8":
                 return load_checkpoint_sdxl_hswq_weight_dtype(
                     ckpt_name, weight_dtype, device=device
                 )

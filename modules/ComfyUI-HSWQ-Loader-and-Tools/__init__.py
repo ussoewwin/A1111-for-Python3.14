@@ -1,8 +1,20 @@
+# --- cp932 → UTF-8: apply before torch (and any file read) uses the locale encoding ---
+import importlib.util as _ilu
+import os as _os
+
+_utf8_patch_spec = _ilu.spec_from_file_location(
+    "win_utf8_patch",
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "win_utf8_patch.py"),
+)
+_utf8_patch_mod = _ilu.module_from_spec(_utf8_patch_spec)
+_utf8_patch_spec.loader.exec_module(_utf8_patch_mod)
+del _ilu, _os, _utf8_patch_spec, _utf8_patch_mod
+
 import logging
 import os
 from pathlib import Path
 
-__version__ = "3.4.0"
+__version__ = "3.6.5"
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -119,6 +131,50 @@ from .utils import get_package_version, get_plugin_version
 # Dynamic INT8 LoRA bake must detect comfy QuantizedTensor only — never bare
 # torch.int8 (Nunchaku SVDQ false positive → Abort on Z-Image / Lumina2).
 
+# ControlLora (LoRA-type ControlNet, e.g. anytest v4) borrows the base UNet's
+# state_dict at pre_run; with ConvRot INT8 / Hybrid ConvRot NVFP4 bases those
+# weights arrive as raw qdata (or sidecar-carrying raw float) and must be
+# dequantized before injection into the float ControlLoraOps control model.
+# Install the ControlLora dequant wrapper unconditionally at startup so it is
+# active regardless of which loader the workflow uses (stock or HSWQ).
+try:
+    from .patches.comfy_quant_int8 import _patch_controllora_int8_dequant
+    if not _patch_controllora_int8_dequant():
+        logger.warning("ControlLora INT8 dequant patch not installed")
+except Exception:
+    logger.exception("ControlLora INT8 dequant patch failed to install")
+
+# comfy_kitchen INT8 unaligned-GEMM fallback (SAM3 boxRPB_embed_x K=2 etc.):
+# dequantize non-multiple-of-4 layers to float instead of crashing.
+try:
+    from .patches.comfy_quant_int8 import _patch_comfy_kitchen_int8_gemm_fallback
+    if not _patch_comfy_kitchen_int8_gemm_fallback():
+        logger.warning("comfy_kitchen INT8 unaligned GEMM fallback not installed")
+except Exception:
+    logger.exception("comfy_kitchen INT8 unaligned GEMM fallback failed to install")
+
+# SAM3 / SAM3.1 ConvRot INT8 load handling: CLIP language_backbone key remap
+# + standard-loader routing, so stock ComfyUI SAM3 nodes work with INT8 ckpts.
+try:
+    from .patches.comfy_quant_int8 import (
+        _patch_sam3_process_state_dict,
+        _patch_load_state_dict_guess_config_int8,
+    )
+    if not _patch_sam3_process_state_dict():
+        logger.warning("SAM3 process_state_dict patch not installed")
+    if not _patch_load_state_dict_guess_config_int8():
+        logger.warning("SAM3 load_state_dict_guess_config patch not installed")
+except Exception:
+    logger.exception("SAM3 INT8 load patches failed to install")
+
+# Model Patch CPU-offload apply patch: keeps ZImageControlPatch on CPU when a
+# MODEL_PATCH was loaded with cpu_offload=True (ported ModelPatchLoaderCustom).
+try:
+    from .patches.model_patch_cpu_offload import apply_model_patch_cpu_offload
+    apply_model_patch_cpu_offload()
+except Exception:
+    logger.exception("Model Patch CPU-offload apply patch failed to install")
+
 # LATENT None-guard: stock VAEDecode / VAEDecodeTiled index samples["samples"],
 # so a dropped LATENT kills the prompt after sampling already finished.
 try:
@@ -129,6 +185,26 @@ except Exception:
     logger.exception("LATENT None-guard not applied")
 
 # HSWQ Ultimate SD Upscale: apply copy_ / FP8 bias / embedder / Lumina compat patches in this extension
+# Distorch purge gate reconciliation API (patches/hswq_purge_rearm.py).
+# Pure function module - installs nothing, patches nothing. DisTorchPurgeVRAMV2
+# (HSWQ toggle) calls hswq_purge_rearm_state() AFTER it peels the ZI / Krea2 /
+# SDXL-product / INT8 overlays for an SDXL handoff. The peel side knows the
+# wrappers, not the module-level apply gates (_PATCHES_APPLIED / _APPLIED /
+# _GPU_BAKE_INSTALLED / _PARITY_APPLIED). If the NEXT prompt reloads Z Image
+# ConvRot NVFP4, Qwen/ControlNet ConvRot INT8, Krea2 or SDXL in the same
+# process, a stale gate could skip re-application and sample on a half-peeled
+# stack (alternating good/bad prompts, 2026-10-07). hswq_purge_rearm_state()
+# inspects live wrapper stamps and resets ONLY the gate whose family layer is
+# actually missing (branch separation: each family has an independent
+# predicate and its own global), so the next load re-applies via the
+# legitimate install path. Safe to call repeatedly on a healthy stack.
+try:
+    from .patches import hswq_purge_rearm as _hswq_purge_rearm  # noqa: F401
+    logger.info("HSWQ purge-rearm reconciliation API registered")
+except Exception:
+    logger.exception("HSWQ purge-rearm module import failed")
+
+
 try:
     from .usdu_compat_patches import apply_usdu_compat_patches
     apply_usdu_compat_patches()
@@ -533,8 +609,16 @@ try:
         sdxl_logger.warning("[SDXL] UNETLoader not found in GLOBAL_NODE_CLASS_MAPPINGS")
     else:
 
-        class HSWQCheckpointLoaderSDXL(_UNETLoaderBase):
-            """HSWQ Checkpoint Loader (SDXL) with device selection. Ref: CheckpointLoaderSimple."""
+        def _checkpoint_looks_int8(ckpt_path):
+            try:
+                from .patches.comfy_quant_int8 import checkpoint_looks_like_comfy_quant_int8
+                return bool(checkpoint_looks_like_comfy_quant_int8(ckpt_path))
+            except Exception:
+                return False
+
+
+        class HSWQCheckpointLoader(_UNETLoaderBase):
+            """HSWQ Checkpoint Loader with device selection. Ref: CheckpointLoaderSimple."""
 
             @classmethod
             def INPUT_TYPES(cls):
@@ -544,25 +628,28 @@ try:
                 devices = get_device_list()
                 default_dev = devices[1] if len(devices) > 1 else devices[0]
                 req = {
-                    "ckpt_name": (folder_paths.get_filename_list("checkpoints"), {"tooltip": "SDXL checkpoint to load MODEL and CLIP from (same as standard Load Checkpoint)."}),
+                    "ckpt_name": (folder_paths.get_filename_list("checkpoints"), {"tooltip": "SDXL or SD1.5 checkpoint to load MODEL and CLIP from (same as standard Load Checkpoint)."}),
                     "weight_dtype": ([
                         "default",
-                        "fp8_e4m3fn",
-                        "fp8_e4m3fn_fast",
-                        "fp8_e5m2",
-                        "int8_tensorwise",
-                        # SDXL only — never reuse Z Image / Krea "Z Image ConvRot NVFP4".
-                        "ConvRot NVFP4",
+                        # SDXL-only marker. Distinct from the SD1.5 ConvRot INT8
+                        # path so the loader can branch per architecture; never
+                        # reuse the raw "int8_tensorwise" name across families.
+                        "SDXL ConvRot INT8",
+                        # SD1.5-only marker (2026-10-17 node picker addition).
+                        # Routes to the vendored nodes/sd1.5 int8 loader (ported
+                        # from the bench stack; probes INT8 and loads inside the
+                        # INT8 Conv2d scope when the file is a comfy_quant pack).
+                        "SD1.5 ConvRot INT8",
                     ],),
                 }
                 opt = {"device": (devices, {"default": default_dev})}
                 return {"required": req, "optional": opt}
 
             RETURN_TYPES = ("MODEL", "CLIP")
-            OUTPUT_TOOLTIPS = ("The UNet diffusion model from checkpoint.", "The CLIP model from the SDXL checkpoint.")
+            OUTPUT_TOOLTIPS = ("The UNet diffusion model from checkpoint.", "The CLIP model from the checkpoint.")
             FUNCTION = "load_checkpoint"
             CATEGORY = "loaders"
-            TITLE = "HSWQ Checkpoint Loader (SDXL)"
+            TITLE = "HSWQ Checkpoint Loader"
 
             def load_checkpoint(self, ckpt_name, weight_dtype, device=None):
                 original_device = get_current_device()
@@ -570,6 +657,29 @@ try:
                     set_current_device(device)
                 try:
                     ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+                    # INT8 (incl. ConvRot) checkpoints MUST go through the INT8-aware
+                    # loader: plain load_checkpoint_guess_config leaves Conv2d
+                    # comfy_quant layers as RAW int8 qdata (absmax ~127, scale
+                    # dropped), which breaks the base forward (NaN) and poisons the
+                    # ControlLora borrowed weights (control output explodes ->
+                    # lineart lock / no coloring / strength dead). Auto-detect
+                    # native comfy_quant INT8 files too.
+                    if weight_dtype == "SD1.5 ConvRot INT8":
+                        # SD1.5 picker (2026-10-17): ported from the bench stack;
+                        # loader lives in nodes/sd1.5 int8 (vendored). Folder
+                        # name has a space/dot so go through the file path.
+                        import importlib.util as _ilu
+
+                        _p = os.path.join(os.path.dirname(__file__), "nodes", "sd1.5 int8", "__init__.py")
+                        _spec = _ilu.spec_from_file_location("hswq_sd15_loader", _p)
+                        _mod = importlib.util.module_from_spec(_spec)
+                        _spec.loader.exec_module(_mod)
+                        return _mod.load_checkpoint_sd15_hswq_weight_dtype(ckpt_path, device=None)
+                    if weight_dtype in ("SDXL ConvRot INT8", "int8_tensorwise") or _checkpoint_looks_int8(ckpt_path):
+                        from .patches.comfy_quant_int8 import load_checkpoint_sdxl_hswq_weight_dtype
+                        return load_checkpoint_sdxl_hswq_weight_dtype(
+                            ckpt_name, weight_dtype, device=None,
+                        )
                     model_options = {}
                     if weight_dtype == "fp8_e4m3fn":
                         model_options["dtype"] = torch.float8_e4m3fn
@@ -578,7 +688,7 @@ try:
                         model_options["fp8_optimizations"] = True
                     elif weight_dtype == "fp8_e5m2":
                         model_options["dtype"] = torch.float8_e5m2
-                    
+
                     out = comfy.sd.load_checkpoint_guess_config(
                         ckpt_path,
                         output_vae=False,
@@ -591,12 +701,12 @@ try:
                 finally:
                     set_current_device(original_device)
 
-        NODE_CLASS_MAPPINGS["HSWQCheckpointLoaderSDXL"] = HSWQCheckpointLoaderSDXL
-        sdxl_logger.info("[SDXL] Registered HSWQCheckpointLoaderSDXL node (MODEL + CLIP)")
+        NODE_CLASS_MAPPINGS["HSWQCheckpointLoader"] = HSWQCheckpointLoader
+        sdxl_logger.info("[SDXL] Registered HSWQCheckpointLoader node (MODEL + CLIP)")
 
         # Z Image Turbo checkpoint loader removed (Nunchaku Z Image Turbo support dropped).
 except Exception as e:
-    sdxl_logger.exception(f"[SDXL] Failed to register HSWQCheckpointLoaderSDXL: {e}")
+    sdxl_logger.exception(f"[SDXL] Failed to register HSWQCheckpointLoader: {e}")
 
 # Z Image FP8 E4M3 UNet Loader (DiT Loader excluded from init)
 try:
@@ -607,17 +717,39 @@ except (ImportError, ModuleNotFoundError) as e:
     logger.debug("HSWQ FP8 E4M3 UNet Loader not registered: %s", e)
 
 try:
-    from .patches.comfy_quant_int8 import install_int8_option_dispatch
+    from .patches.comfy_quant_int8 import (
+        install_int8_option_dispatch,
+        _patch_comfy_kitchen_rms_rope_fallback,
+        _patch_comfy_kitchen_int8_gemm_fallback,
+    )
+    _patch_comfy_kitchen_rms_rope_fallback()
+    _patch_comfy_kitchen_int8_gemm_fallback()
     install_int8_option_dispatch(NODE_CLASS_MAPPINGS)
 except Exception as e:
     logger.exception("[HSWQ INT8] install_int8_option_dispatch: %s", e)
 
 # After INT8 dispatch: NVFP4 ckpts also have int8 Conv markers; NVFP4 must win first.
 try:
-    from .nodes.nvfp4.comfy_quant_nvfp4 import install_nvfp4_option_dispatch
+    from .nodes.sdxl_convrot_nvfp4.comfy_quant_nvfp4 import install_nvfp4_option_dispatch
     install_nvfp4_option_dispatch(NODE_CLASS_MAPPINGS)
 except Exception as e:
     logger.exception("[HSWQ NVFP4] install_nvfp4_option_dispatch: %s", e)
+
+# DisTorch2 variant of the HSWQ UNet Loader: the whole UNet can be held on CPU
+# (virtual VRAM, donor_device=cpu) when a run heavily exceeds VRAM.
+# Backend ported from ComfyUI-MultiGPU (pollockjj, GPL-3.0) - see distorch/distorch_2.py.
+try:
+    from .nodes.hswq_unet_distorch2 import build_distorch2_unet_loader
+    # DisTorch2 wrapper on the dispatched HSWQ UNet loader (Krea2 / Z Image
+    # ConvRot INT8 + NVFP4 routing and the INT8 LoRA bake stay consistent).
+    _hswq_distorch2_base = NODE_CLASS_MAPPINGS.get("HSWQFP8E4M3UNetLoader") or HSWQFP8E4M3UNetLoader
+    NODE_CLASS_MAPPINGS["HSWQUNetLoaderDisTorch2"] = build_distorch2_unet_loader(_hswq_distorch2_base)
+    logger.info(
+        "Registered HSWQ UNet Loader (DisTorch2) build=hswq-base+distorch2 base=%s",
+        getattr(_hswq_distorch2_base, "__name__", _hswq_distorch2_base),
+    )
+except Exception as e:
+    logger.exception("HSWQ UNet Loader (DisTorch2) not registered: %s", e)
 
 # SDXL LoRA Stack V3 (INT8 / NVFP4 / standard via load_lora_for_models bake path)
 try:
@@ -656,9 +788,51 @@ try:
 except (ImportError, ModuleNotFoundError) as e:
     logger.debug("HSWQ Torch Compile not registered: %s", e)
 
+try:
+    from .nodes.hswq_load_convrot_int8_controlnet import (
+        HSWQControlNetLoader,
+        HSWQLoadConvRotINT8ControlNet,
+    )
+    NODE_CLASS_MAPPINGS["HSWQControlNetLoader"] = HSWQControlNetLoader
+    NODE_CLASS_MAPPINGS["HSWQLoadConvRotINT8ControlNet"] = HSWQLoadConvRotINT8ControlNet
+    logger.info("Registered HSWQ ControlNet Loader (ConvRot INT8)")
+except (ImportError, ModuleNotFoundError) as e:
+    logger.debug("HSWQ ControlNet Loader not registered: %s", e)
+
+try:
+    from .nodes.hswq_load_convrot_int8_sam3 import (
+        HSWQSAM3Loader,
+        HSWQLoadConvRotINT8SAM3,
+    )
+    NODE_CLASS_MAPPINGS["HSWQSAM3Loader"] = HSWQSAM3Loader
+    NODE_CLASS_MAPPINGS["HSWQLoadConvRotINT8SAM3"] = HSWQLoadConvRotINT8SAM3
+    logger.info("Registered HSWQ SAM3 Loader (ConvRot INT8)")
+except (ImportError, ModuleNotFoundError) as e:
+    logger.debug("HSWQ SAM3 Loader not registered: %s", e)
+
+try:
+    from .nodes.hswq_sam3_detect import HSWQSAM3DetectV1
+    NODE_CLASS_MAPPINGS["HSWQSAM3Detect"] = HSWQSAM3DetectV1
+    logger.info("Registered HSWQ SAM3 Detect")
+except (ImportError, ModuleNotFoundError) as e:
+    logger.debug("HSWQ SAM3 Detect not registered: %s", e)
+
+try:
+    from .nodes.hswq_model_patch_loader import HSWQModelPatchLoaderCustom
+    NODE_CLASS_MAPPINGS["HSWQModelPatchLoaderCustom"] = HSWQModelPatchLoaderCustom
+    logger.info("Registered HSWQ Model Patch Loader (ConvRot INT8 / CPU offload)")
+except (ImportError, ModuleNotFoundError) as e:
+    logger.debug("HSWQ Model Patch Loader not registered: %s", e)
 NODE_DISPLAY_NAME_MAPPINGS = {k: getattr(v, "TITLE", k) for k, v in NODE_CLASS_MAPPINGS.items()}
-# Explicit override — TITLE alone is not enough for ComfyUI graph node headers.
-NODE_DISPLAY_NAME_MAPPINGS["HSWQCheckpointLoaderSDXL"] = "HSWQ Checkpoint Loader (SDXL)"
+# Explicit overrides — TITLE alone is not enough for some ComfyUI graph headers / search menus.
+NODE_DISPLAY_NAME_MAPPINGS["HSWQCheckpointLoader"] = "HSWQ Checkpoint Loader"
+NODE_DISPLAY_NAME_MAPPINGS["HSWQControlNetLoader"] = "HSWQ ControlNet Loader (ConvRot INT8)"
+NODE_DISPLAY_NAME_MAPPINGS["HSWQLoadConvRotINT8ControlNet"] = "HSWQ ControlNet Loader (ConvRot INT8)"
+NODE_DISPLAY_NAME_MAPPINGS["HSWQSAM3Loader"] = "HSWQ SAM3 Loader (ConvRot INT8)"
+NODE_DISPLAY_NAME_MAPPINGS["HSWQLoadConvRotINT8SAM3"] = "HSWQ SAM3 Loader (ConvRot INT8)"
+NODE_DISPLAY_NAME_MAPPINGS["HSWQSAM3Detect"] = "HSWQ SAM3 Detect"
+NODE_DISPLAY_NAME_MAPPINGS["HSWQFP8E4M3UNetLoader"] = "HSWQ UNet Loader (Z Image / Krea2)"
+NODE_DISPLAY_NAME_MAPPINGS["HSWQUNetLoaderDisTorch2"] = "HSWQ UNet Loader (Z Image / Krea2) (DisTorch2)"
 WEB_DIRECTORY = "js"
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 logger.info("=" * (80 + len(" ComfyUI-nunchaku Initialization ")))

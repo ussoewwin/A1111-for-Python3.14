@@ -17,27 +17,37 @@ This custom node pack loads and runs **[Hybrid-Sensitivity-Weighted-Quantization
 
 **HSWQ** (the quantization method, scripts, and upstream docs) is an **original work by ussoewwin**, published separately under the **GNU Affero General Public License v3 (AGPL-3.0)** at [ussoewwin/Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization). This ComfyUI loader pack is a related but distinct repository (see License below).
 
-HSWQ is a high-fidelity quantization line for diffusion UNets. Current public HSWQ work focuses on **ConvRot INT8** and **ConvRot NVFP4** for **SDXL**, plus **ConvRot NVFP4** for **Z Image / ZIT** UNets (sensitivity / importance analysis, DualMonitor + weighted-histogram FP16 protection, then FULL ConvRot on the remainder). It is **not** a keep-ratio percentage scheme: keep ratio is fixed at **0 (r0)**; FP16 layers are chosen by automatic analysis under a fixed MiB budget.
+HSWQ is a high-fidelity quantization line for diffusion UNets. Current public HSWQ work focuses on **ConvRot INT8** for **SDXL** (reverse hybrid), plus **ConvRot NVFP4** for **Z Image / ZIT** UNets and **ConvRot INT8** for **Krea2** UNets. **SDXL ConvRot NVFP4 development has been cancelled**: deterministic trajectory measurements showed that 4-bit precision fails to preserve latent trajectory fidelity on SDXL, so SDXL is supported strictly in **ConvRot INT8**. For SDXL ConvRot INT8 (reverse hybrid), the FP16 checkpoint is the only input; a per-layer **trajectory-impact** ranking packs the **K lowest-impact layers** as **FULL ConvRot INT8** while every other layer stays FP16 — not a keep-ratio percentage scheme.
 
 | Path | Role in this repo |
 | :--- | :--- |
-| **HSWQ ConvRot INT8 (SDXL V3.1)** | ComfyUI `int8_tensorwise` packs; load via **HSWQ Checkpoint Loader (SDXL)** (`weight_dtype`: `int8_tensorwise` / INT8 auto-detect). **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).** |
-| **HSWQ ConvRot NVFP4 (SDXL)** | ComfyUI `nvfp4` packs (Linear→NVFP4, Conv2d→INT8 + ConvRot); load via the **same** **HSWQ Checkpoint Loader (SDXL)** (`weight_dtype`: `ConvRot NVFP4`, or `default` with NVFP4 auto-detect). **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).** |
-| **HSWQ ConvRot NVFP4 (Z Image / ZIT)** | ComfyUI `nvfp4` UNet packs (often Linear NVFP4 + INT8 protect); load via **HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader** (`weight_dtype`: `ConvRot NVFP4`, or `default` with NVFP4 auto-detect). Uses the bench-matched **Comfy parity** path (stock GEMM + online act rotate), not the SDXL Tensor Core product path. **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).** |
+| **HSWQ ConvRot INT8 (SDXL, reverse hybrid)** | ComfyUI `int8_tensorwise` packs (K lowest-impact layers → FULL ConvRot INT8, every other layer stays FP16; no embedded VAE — decode with a separate SDXL VAE); load via **HSWQ Checkpoint Loader** (`weight_dtype`: `int8_tensorwise` / INT8 auto-detect). Validated by the deterministic 25-seed latent-trajectory gate (cosine mean ≥ 0.95, 0/25 bifurcated). **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).** |
+| **HSWQ ConvRot NVFP4 (Z Image / ZIT)** | ComfyUI `nvfp4` UNet packs (often Linear NVFP4 + INT8 protect; built by the reverse method — lowest-impact layers converted first); load via **HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader** (`weight_dtype`: `Z Image ConvRot NVFP4`, or `default` with NVFP4 auto-detect). Uses the bench-matched **Comfy parity** path (stock GEMM + online act rotate). Validated by the deterministic 20-seed latent-trajectory gate (cosine mean ≥ 0.95, 0/20 bifurcated). **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).** |
+| **HSWQ ConvRot INT8 (Krea2)** | ComfyUI `int8_tensorwise` UNet packs (Krea2 packs carry `txtfusion.projector`); load via **HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader** (`weight_dtype`: `int8_tensorwise`, or `default` with INT8 auto-detect). HSWQ pipeline: structure blacklist protection (`first.` / `last.` / `mod.` / `norm` / `projector` / `txtfusion`) + 4-axis composite ranking; bias correction omitted (`1off`). Krea2 uses a stock-equivalent ConvRot INT8 load (no Z Image parity) and is the **only `weight_dtype` verified with the DisTorch2 loader**. **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).** |
 | **FP8 (E4M3)** | HSWQ **FP8 development has ended** (technical docs remain upstream). Loaders here may still accept existing FP8 weights where ComfyUI supports them |
 | **Z Image 8-bit** | HSWQ-specific Z Image INT8 development / publication **ended**. Prefer **native ConvRot INT8** for Z Image (typically SSIM > 0.99). HSWQ INT8 continues for **SDXL**. **Z Image ConvRot NVFP4** is supported via the UNet loader above |
 
-Upstream HSWQ targets (reference): ConvRot INT8 SSIM about **0.94–0.98**, ConvRot NVFP4 about **0.95**, with roughly **30–40%** smaller files than FP16 while keeping standard ComfyUI loader compatibility.
+Upstream HSWQ validation (reference): quality is gated by the **deterministic latent-trajectory comparison** (per-step cosine + bifurcation; legacy decoded SSIM scores were masked by VAE decoding and are no longer used) — **SDXL ConvRot INT8 (reverse hybrid): cosine mean ≥ 0.95 (25 seeds)**, **Krea2 ConvRot INT8: cosine mean ≥ 0.98 (25 seeds)**, **Z Image Hybrid ConvRot NVFP4: cosine mean 0.96–0.97 (20 seeds)** — with files about **29–40%** smaller than FP16 while keeping standard ComfyUI loader compatibility.
 
 **Quantization scripts, How-to docs, and benchmarks:** [ussoewwin/Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization)
 
 **Published HSWQ SDXL models (ConvRot INT8):** [Hugging Face — Hybrid-Sensitivity-Weighted-Quantization-SDXL-ConvRot-INT8](https://huggingface.co/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization-SDXL-ConvRot-INT8)
 
-**Published HSWQ SDXL models (ConvRot NVFP4):** [Hugging Face — Hybrid-Sensitivity-Weighted-Quantization-SDXL-ConvRot-NVFP4](https://huggingface.co/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization-SDXL-ConvRot-NVFP4)
+**Published HSWQ Z Image / ZIT models (ConvRot NVFP4):** [Hugging Face — Hybrid-Sensitivity-Weighted-Quantization-Z-Image-Hybrid-ConvRot-NVFP4](https://huggingface.co/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization-Z-Image-Hybrid-ConvRot-NVFP4)
 
 <p align="center">
 <img src="https://raw.githubusercontent.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/main/logo.png" width="400">
 </p>
+
+## Universal Workflow Requirement: VRAM Purge (All HSWQ Models & Nodes)
+
+> [!IMPORTANT]
+> **Mandatory for all HSWQ workflows (ConvRot INT8 / ConvRot NVFP4)**:
+> In any workflow using HSWQ models or nodes (SDXL checkpoints, UNet loaders, ControlNet, Model Patches, etc.), **always place General Purge VRAM V2 from [ComfyUI-DistorchMemoryManager](https://github.com/ussoewwin/ComfyUI-DistorchMemoryManager) at the very end of your workflow and enable its `HSWQ` toggle**.
+>
+> If your workflow uses the **Model Patch Loader** (e.g. HSWQ Model Patch Loader for ControlNet / feature projectors), you **must also turn ON `clear_model_patches` (Model Patch purge)** on the General Purge VRAM V2 node.
+>
+> This is **not specific to any single loader or node**, but is a **universal requirement across all HSWQ operations**. HSWQ residual GPU/host memory, NVFP4 runtime execution pools, Tensor Core workspaces, and CUDA graphs are not fully released by ComfyUI's generic model unload routines. Without this purge node at the end of the workflow, subsequent runs (such as generating a second image) can fail with errors such as `quantize_nvfp4`, `PyCapsule`, or `pooled TC path failed`.
 
 ## Installation
 
@@ -57,60 +67,200 @@ Restart ComfyUI to load the nodes.
 
 ## Nodes
 
-### HSWQ Checkpoint Loader (SDXL)
+### HSWQ Checkpoint Loader
 
-<img src="png/fp8e4m3.png?v=3" alt="HSWQ Checkpoint Loader (SDXL) Node" width="400">
+<img src="png/fp8e4m3.png?v=3" alt="HSWQ Checkpoint Loader Node" width="400">
 
-ComfyUI node that loads **MODEL** and **CLIP** from standard SDXL checkpoints, with optional device selection and **FP8 / INT8 / ConvRot NVFP4** precision support. Use it like the standard Load Checkpoint node; it outputs MODEL and CLIP only (no VAE).
+High-performance unified checkpoint loader for **SDXL** and **SD1.5** models, providing optional device selection, architecture-specialized **ConvRot INT8** precision pipelines, and whole-denoiser **CUDA-Graph replay** acceleration. Operates like the standard ComfyUI Load Checkpoint node; outputs **MODEL** and **CLIP** (decode latents using a separate VAE loader).
 
-**SDXL ConvRot INT8** and **SDXL ConvRot NVFP4** are **supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization)**. Other third-party ConvRot INT8 / ConvRot NVFP4 packs are out of scope.
+Both **SDXL ConvRot INT8** and **SD1.5 ConvRot INT8** are **supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization)**. Other third-party quantization packs are out of scope.
 
-**ConvRot NVFP4:** Select `weight_dtype` = **`ConvRot NVFP4`**, or leave **`default`** when the checkpoint has comfy_quant `nvfp4` markers — the loader routes to this extension’s NVFP4 stack (Linear → NVFP4 Tensor Core / `scaled_mm_nvfp4` + optional act ConvRot; Conv2d → INT8 + ConvRot via the INT8 patches). NVFP4 dispatch is installed **after** INT8 dispatch so mixed packs (NVFP4 Linear + INT8 Conv) are not stolen by INT8-only auto-detect.
+#### Architecture-Specific Quantization Pipelines
 
-This loader does **not** ship an in-node Triton accelerate toggle. INT8 Linear speed is left to **ComfyUI + `comfy_kitchen`** (`int8_linear`: cuda → triton → eager). This extension keeps INT8 **load compatibility** patches (Conv2d / LoRA / ControlLora / handoff) and the **NVFP4** load + forward patches under `nodes/nvfp4/`.
+- **SD1.5 ConvRot INT8 (`weight_dtype`: `SD1.5 ConvRot INT8`)**:
+  - **Full-stack runtime embedded under `nodes/sd1.5 int8/`**: Merged byte-identical with the benchmark stack (4-copy SHA256 validated).
+  - **Triton Fused ConvRot W8A8 IMMA Conv2d kernel** (`_int8_conv_rot_imma`): Combines gather-quant, 8-way Hadamard activation rotation, and IMMA GEMM into a single fused GPU kernel.
+  - **Whole-Denoiser CUDA-Graph Replay Executor** (`_Sd15CudaGraphExecutor`): Pre-staticizes weights for capture (zero allocation pump during capture), fail-fast arming (raises immediately outside the static capture range), and per-capture Triton fallback under the default PyTorch caching allocator.
+  - **Double-Arm Protection** (`_hswq_sd15_graph_armed`): Prevents multiple imports from wrapping the base model twice, eliminating stream capture invalidations (`cudaErrorStreamCaptureUnsupported 900`).
+  - **CLIP Preservation in FP16**: The embedded CLIP model is kept strictly in FP16 to maintain full text-conditioning fidelity (cosine 0.99987 vs. FP16 baseline).
+  - **Measured Speedup (512x512, RTX 5060 Ti)**: Steady-state **17.18–17.34 it/s vs. FP16 15.03–15.22 it/s (+14.5%)**, reducing per-seed duration from 1.72 s down to 1.50 s (+12.8%).
+
+- **SDXL ConvRot INT8 (`weight_dtype`: `SDXL ConvRot INT8`)**:
+  - **Reverse Hybrid Ranking**: The $K$ lowest-impact layers are packed as FULL ConvRot INT8 while all sensitive layers remain in FP16, preserving latent trajectory fidelity (cosine mean $\ge 0.95$, 0/25 bifurcated across 25 seeds).
+  - **Conv2d Scope & MixedPrecisionOps**: Patches Conv2d quantized weight handling so UNet convolutional layers dequantize and compute properly without gradient or tensor errors.
+  - **SDXL CLIP INT8 Quantization**: Consumes embedded `clip_l` and `clip_g` ConvRot INT8 metadata (`arm_sdxl_clip_quant_metadata`).
+  - **Whole-Denoiser CUDA Graph Acceleration** (`_arm_sdxl_cudagraph`): Graph capture and replay for steady-state sampling speedup with automatic fallback to pooled-rotate eager execution.
+  - **Backward Compatibility**: Workflows with legacy `weight_dtype` = `int8_tensorwise` automatically route to this path.
+
+- **Standard / Auto-Detect (`weight_dtype`: `default`)**:
+  - Uses standard `load_checkpoint_guess_config` for FP16 and FP8 checkpoints.
+  - Automatically probes safetensors metadata via `checkpoint_looks_like_comfy_quant_int8`: if comfy_quant INT8 markers are detected, it routes directly to the specialized INT8 execution path.
+  - Legacy comfy_quant NVFP4 checkpoints are detected and routed to the NVFP4 compatibility layer.
 
 #### Features
 
-- **Checkpoint Loading**: Loads both UNet (MODEL) and CLIP from a single SDXL checkpoint file (same as standard Load Checkpoint)
-- **Device Selection**: Optional device parameter to choose GPU (e.g. `cuda:0`, `cuda:1`) or CPU for model loading
-- **FP8 weight dtype**: `fp8_e4m3fn`, `fp8_e4m3fn_fast`, `fp8_e5m2` (plus `default` for non-forced dtype)
-- **INT8 weight dtype**: `int8_tensorwise` — **HSWQ SDXL ConvRot INT8** via ComfyUI `MixedPrecisionOps` (this extension also patches **Conv2d** quant load so SD UNet INT8 works, not Linear-only). **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).**
-- **ConvRot NVFP4 weight dtype**: `ConvRot NVFP4` — **HSWQ SDXL ConvRot NVFP4** (`comfy_quant` `nvfp4`: Linear NVFP4 + Conv2d INT8 / ConvRot); applies `nodes/nvfp4` patches (packed-K detect, full NVFP4 Linear load, Tensor Core forward). **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).**
-- **INT8 auto-detect**: If the safetensors looks like comfy_quant INT8 (and is not NVFP4), the loader uses the MixedPrecisionOps / INT8 path even when `weight_dtype` is not set to `int8_tensorwise`
-- **NVFP4 auto-detect**: If `weight_dtype` is `default` and the checkpoint looks like comfy_quant NVFP4, the loader uses the ConvRot NVFP4 path automatically
-- **Standard ComfyUI Integration**: Uses `load_checkpoint_guess_config`; compatible with standard ComfyUI workflows
-- **No Triton accelerate widget**: UI is checkpoint / weight dtype / device only; fused INT8 Linear acceleration is not controlled from this node
+- **Multi-Architecture Checkpoint Loading**: Loads both UNet (MODEL) and CLIP from standard SDXL or SD1.5 checkpoints
+- **Dedicated `weight_dtype` Routing**: Explicit dropdown options for `default`, `SDXL ConvRot INT8`, and `SD1.5 ConvRot INT8`
+- **Device Selection**: Optional device parameter to specify target GPU (e.g. `cuda:0`, `cuda:1`) or CPU for initial placement
+- **CUDA Graph Acceleration**: Built-in denoiser CUDA Graph executors for both SD1.5 and SDXL pipelines
+- **Standard ComfyUI Integration**: Fully compatible with downstream ComfyUI sampling, conditioning, and LoRA nodes
 
 #### Usage Notes
 
-- **Inputs**: `ckpt_name` (checkpoint file), `weight_dtype` (`default` / FP8 options / `int8_tensorwise` / `ConvRot NVFP4`), and optionally `device`
-- **Outputs**: MODEL and CLIP only; use a separate VAE loader if needed
-- **Category**: Loaders (`loaders`)
-- **SDXL ConvRot INT8 / ConvRot NVFP4 compatibility**: **Only** checkpoints quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization)
-- **ConvRot NVFP4 models**: Published packs — [Hybrid-Sensitivity-Weighted-Quantization-SDXL-ConvRot-NVFP4](https://huggingface.co/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization-SDXL-ConvRot-NVFP4)
-- **INT8 speed**: Rely on ComfyUI / `comfy_kitchen` for Linear acceleration; this node does not install or toggle Triton
+- **Inputs**:
+  - `ckpt_name`: Checkpoint filename under `models/checkpoints`
+  - `weight_dtype`: Precision mode — `default` (auto-detect / FP16), `SDXL ConvRot INT8`, or `SD1.5 ConvRot INT8`
+  - `device`: Target execution device (`cuda:0`, `cuda:1`, etc.)
+- **Outputs**: `MODEL` and `CLIP` only; pair with a separate VAE loader node for decoding
+- **Category**: `loaders`
+- **Compatibility**: Only checkpoints quantized using [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization)
 - **INT8 + LoRA**: For INT8 LoRA bake / Status logging details, see `md/HSWQ_INT8_AND_LORA_TECHNICAL_GUIDE.md`
-- **VRAM purge (required for HSWQ ConvRot INT8 / ConvRot NVFP4)**: When you load with **HSWQ ConvRot INT8** or **HSWQ ConvRot NVFP4**, always place **General Purge VRAM V2** from [ComfyUI-DistorchMemoryManager](https://github.com/ussoewwin/ComfyUI-DistorchMemoryManager) at the **end** of the workflow and turn its **`HSWQ`** toggle **on**. HSWQ residual GPU/host memory (and NVFP4 runtime pools / CUDA graphs) is not fully released by ComfyUI's generic unload, so a second generation after the first can fail (e.g. `quantize_nvfp4` / `PyCapsule` / `pooled TC path failed`) without this purge.
+- **VRAM Purge (Universal HSWQ Requirement)**: Always place **General Purge VRAM V2** from [ComfyUI-DistorchMemoryManager](https://github.com/ussoewwin/ComfyUI-DistorchMemoryManager) at the end of the workflow and enable its **`HSWQ`** toggle.
 
 ### HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader
 
-<img src="png/hswqunet.png?v=3" alt="HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader" width="400">
+<img src="png/hswqunet.png?v=4" alt="HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader" width="400">
 
 Standard ComfyUI UNet loader wrapper for diffusion models under `diffusion_models` (**Z Image / ZIT** and other UNet packs). Loads **MODEL** with FP8, INT8, and **ConvRot NVFP4** weight dtypes.
 
 **Z Image / ZIT ConvRot NVFP4** is **supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization)**. Other third-party ConvRot NVFP4 UNet packs are out of scope.
 
 - **General FP8 / INT8**: Same idea as the stock UNet loader (HSWQ FP8 E4M3, Scaled FP8, and native comfy_quant / `int8_tensorwise` when selected or auto-detected). Not limited to HSWQ-only weights for those modes.
-- **ConvRot NVFP4 (Z Image / ZIT)**: Select `weight_dtype` = **`ConvRot NVFP4`**, or leave **`default`** when the UNet safetensors has comfy_quant / HSWQ `nvfp4` markers. Routes to this extension’s UNet NVFP4 stack under `nodes/nvfp4/` with the **Comfy parity** path used by `hswq/benchmark` (stock MixedPrecision GEMM + online act rotate; ConvRot Linear LoRA bake kept). **Do not** expect the SDXL Checkpoint Loader’s Tensor Core product path here — SDXL NVFP4 stays on the Checkpoint Loader; Z Image NVFP4 stays on this UNet loader. **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).**
+- **ConvRot NVFP4 (Z Image / ZIT)**: Select `weight_dtype` = **`Z Image ConvRot NVFP4`**, or leave **`default`** when the UNet safetensors has comfy_quant / HSWQ `nvfp4` markers. Routes to this extension’s UNet NVFP4 stack under `nodes/nvfp4/` with the **Comfy parity** path used by `hswq/benchmark` (stock MixedPrecision GEMM + online act rotate; ConvRot Linear LoRA bake kept). **Do not** expect a Tensor Core product path here — Z Image ConvRot NVFP4 runs on the **Comfy parity** path of this UNet loader. **Supported only for models quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization).**
 - **INT8 / NVFP4 auto-detect**: INT8-looking packs use the INT8 path; NVFP4-looking packs use the ConvRot NVFP4 path when `weight_dtype` is `default` (NVFP4 dispatch is installed after INT8 so mixed packs are not stolen by INT8-only detect).
-
-**Inputs**: `unet_name`, `weight_dtype` (`default` / FP8 options / `int8_tensorwise` / `ConvRot NVFP4`).
 
 This loader does **not** ship an in-node Triton accelerate toggle. INT8 Linear speed is left to **ComfyUI + `comfy_kitchen`** (`int8_linear`: cuda → triton → eager). This extension keeps INT8 **load compatibility** patches (Conv2d / LoRA / ControlLora / handoff) and the **NVFP4** UNet patches under `nodes/nvfp4/`.
 
 - **Z Image / ZIT ConvRot NVFP4 compatibility**: **Only** UNet packs quantized with [Hybrid-Sensitivity-Weighted-Quantization](https://github.com/ussoewwin/Hybrid-Sensitivity-Weighted-Quantization)
 
-**VRAM purge**: For **ConvRot NVFP4** (and HSWQ INT8) UNet loads, place **General Purge VRAM V2** from [ComfyUI-DistorchMemoryManager](https://github.com/ussoewwin/ComfyUI-DistorchMemoryManager) at the end of the workflow with **`HSWQ`** on — same reason as the SDXL Checkpoint Loader section.
+- **VRAM purge (Universal HSWQ requirement)**: Same universal requirement as above — place **General Purge VRAM V2** ([ComfyUI-DistorchMemoryManager](https://github.com/ussoewwin/ComfyUI-DistorchMemoryManager)) at the end of the workflow with its **`HSWQ`** toggle turned on for all HSWQ runs.
+
+### HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader (DisTorch2)
+
+<img src="png/distorch.png" alt="HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader (DisTorch2)" width="400">
+
+DisTorch2 variant of the loader above: the **whole UNet** can live outside VRAM (virtual VRAM + a donor device such as `cpu`), so packs larger than the GPU can still run. Backend ported from [ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU) (GPL-3.0) - see `distorch/distorch_2.py`.
+
+**Why this DisTorch2 node exists**: [ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU) already ships a DisTorch2 loader, but it has **no HSWQ ConvRot NVFP4 support**. This node exists so that the **large HSWQ packs** (e.g. Z Image Hybrid ConvRot NVFP4, Krea2 ConvRot INT8) can be run together with DisTorch offload.
+
+**Current support: Krea2 ConvRot INT8 only.** Other `weight_dtype` choices are not verified with DisTorch2 yet.
+
+**Speed - this node is not unconditionally faster than the plain loader.** On a 16 GB-class GPU (e.g. RTX 5060 Ti 16GB), a **simple generation is faster with the plain HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader**. It is **only when the workload gets heavy** - **high resolution, many LoRAs, ControlNet and other complex combinations** - that this node is faster than the plain loader, because it loses less speed.
+
+**To get the best out of DisTorch, `virtual_vram_gb` should be **at least the size of the UNet** - for **Krea2 ConvRot INT8** that is **14 GB or more**. That in turn requires a large amount of system RAM: **64 GB minimum**.
+
+**Inputs**: the same loader inputs as above, plus the DisTorch2 allocation inputs (`compute_device`, `virtual_vram_gb`, `donor_device`, `expert_mode_allocations`, `eject_models`) and **`hswq_bake`**:
+
+| Value | Behaviour |
+| :--- | :--- |
+| **`OFF`** | Stock ComfyUI path under DynamicVRAM. The HSWQ patches (LoRA bake / parity / mp stack) are skipped, so offloaded weights sit in the DynamicVRAM host buffer (**shared VRAM**). **This is the faster mode for Krea2 ConvRot INT8.** |
+| **`ON`** | HSWQ path (HSWQ LoRA bake + legacy patcher, so DisTorch placement runs). This mode is intended for **Hybrid ConvRot NVFP4** support (e.g. Z Image), where HSWQ's own LoRA handling is required. Slower than `OFF` on Krea2 ConvRot INT8. |
+
+### HSWQ ControlNet Loader (ConvRot INT8)
+
+<img src="png/convrot_int8_controlnet.png" alt="HSWQ ControlNet Loader (ConvRot INT8)" width="400">
+
+ComfyUI loader node for **ConvRot / TensorWise INT8-quantized ControlNet checkpoints** (e.g. Qwen Image Fun ControlNet). Loads the ControlNet directly into VRAM in 8-bit precision (`QuantizedTensor` / `TensorWiseINT8Layout`) and executes via `comfy_kitchen`'s high-speed `int8_linear` kernel with online activation rotation (`convrot`).
+
+Standard ComfyUI `controlnet_load_state_dict` sets architecture dtype to `weight_dtype(sd)` (which is `torch.int8` for quantized models), triggering PyTorch gradient creation errors (`Only Tensors of floating point and complex dtype can require gradients`) and ignoring `comfy_quant` metadata. This node solves both issues by forcing the module graph construction to `torch.bfloat16` and explicitly injecting `MixedPrecisionOps` configured for `int8_tensorwise`.
+
+#### Features
+
+- **Native INT8 VRAM Retention**: Keeps weights in 8-bit precision in VRAM with `TensorWiseINT8Layout`, significantly reducing memory consumption
+- **Fast Execution**: Uses `comfy_kitchen` `int8_linear` GEMM kernel with online activation rotation for ConvRot layers
+- **ComfyUI Standard Integration**: Produces a standard `CONTROL_NET` output compatible with stock `Apply ControlNet` nodes
+- **Seamless FP16 / BF16 / FP8 Compatibility (Drop-in Replacement)**: Fully backwards-compatible with conventional non-quantized and FP8 ControlNet models. When loading checkpoints without INT8 `comfy_quant` layers, it automatically delegates directly to stock ComfyUI `load_controlnet_state_dict`, so you can use this single loader node for all ControlNet formats without workflow changes
+
+#### Usage Notes
+
+- **Inputs**: `control_net_name` (safetensors ControlNet model from the `models/controlnet` directory)
+- **Outputs**: `CONTROL_NET`
+- **Category**: Loaders (`loaders`)
+- **Drop-in replacement**: Can replace ComfyUI's built-in "Load ControlNet Model" node entirely — automatically handles ConvRot INT8, FP8, BF16, and FP16 checkpoints without manual switching
+
+### HSWQ SAM3 Loader (ConvRot INT8) & SAM3 Detect
+
+<img src="png/sam3.png" alt="HSWQ SAM3 Loader & SAM3 Detect" width="500">
+
+ComfyUI loader and detector nodes for **ConvRot / TensorWise INT8-quantized SAM3 (Segment Anything 3) checkpoints**. Loads the SAM3 model directly into VRAM in 8-bit precision (`QuantizedTensor` / `TensorWiseINT8Layout`) and executes via `comfy_kitchen`'s high-speed `int8_linear` kernel with online activation rotation (`convrot`).
+
+Includes automatic hardware safety fallback for unaligned layers (such as `boxRPB_embed_x` with $K=2$), dynamically dequantizing non-multiple-of-4 dimensions while running all heavy backbone and transformer blocks in accelerated INT8 Tensor Core precision.
+
+#### Features
+
+- **Native INT8 VRAM Retention**: Keeps weights in 8-bit precision in VRAM with `TensorWiseINT8Layout`, cutting memory requirements significantly
+- **Fast Execution**: Uses `comfy_kitchen` `int8_linear` GEMM kernel with online activation rotation for ConvRot layers
+- **Automatic Fallback Protection**: Layers with unaligned dimensions ($K \% 4 \neq 0$) safely compute in float precision without crashing cuBLAS INT8 GEMM
+- **Seamless Compatibility**: Produces standard `MODEL` output compatible with **HSWQ SAM3 Detect** and stock ComfyUI SAM3 detection/tracking nodes
+
+#### Nodes
+
+**HSWQ SAM3 Loader (ConvRot INT8)** — category `loaders`
+
+- **Input** `sam3_name`: ConvRot INT8 / standard SAM3 checkpoint (`.safetensors`), searched across `diffusion_models` / `sams` / `detection` / `checkpoints`
+- **Output** `model` (`MODEL`): standard ComfyUI model, compatible with HSWQ SAM3 Detect and stock SAM3 nodes
+- Detects `int8_tensorwise` comfy_quant metadata and auto-attaches `MixedPrecisionOps`, keeping Linear layers **true INT8 in VRAM**
+- Non-INT8 checkpoints load normally (no MixedPrecisionOps attached)
+
+**HSWQ SAM3 Detect** — category `HSWQ/Detection`
+
+- **Inputs**
+  - `model` (`MODEL`): SAM3 model (from HSWQ SAM3 Loader or CheckpointLoaderSimple)
+  - `image` (`IMAGE`): input image (batches supported)
+  - `conditioning` (`CONDITIONING`, optional): text prompts, e.g. CLIPTextEncode `"person"`
+  - `bboxes` (`BBOXES`, optional): boxes to segment within
+  - `positive_coords` / `negative_coords` (`STRING`, optional): point prompts as JSON `[{"x": int, "y": int}, ...]` (pixel coords)
+  - `threshold` (default `0.50`): detection score threshold
+  - `refine_iterations` (default `2`): SAM decoder refinement passes (`0` = raw detector masks)
+  - `individual_masks` (default `false`): output per-object masks instead of union
+- **Outputs**
+  - `masks` (`MASK`): binary segmentation masks
+  - `bboxes` (`BBOXES`): detected boxes with scores
+  - `image` (`IMAGE`): pass-through input image
+
+#### Example workflow
+
+1. **HSWQ SAM3 Loader** → select `sam3.1_multiplex_convrot_int8.safetensors`
+2. **CheckpointLoaderSimple** (same checkpoint) → **CLIPTextEncode** (`"person"`) for text-conditioned detection
+3. **HSWQ SAM3 Detect** → connect `model`, `image`, and `conditioning`
+4. **MaskPreview+** → visualize the `masks` output
+
+#### FP16 compatibility
+
+Both nodes fully support **standard FP16 SAM3 checkpoints** (e.g. `sam3.1_multiplex_fp16.safetensors`):
+
+- **HSWQ SAM3 Loader** detects the absence of `int8_tensorwise` comfy_quant metadata and loads the checkpoint with stock ComfyUI settings (no MixedPrecisionOps, no behavior change)
+- **HSWQ SAM3 Detect** runs identically on FP16 and INT8 models — the runtime weight guard dequantizes INT8 layers to FP16 internally, so both paths produce equivalent masks
+- FP16 checkpoints also work through the stock **CheckpointLoaderSimple** thanks to the HSWQ CLIP remap patch (no "clip missing" warning)
+
+### HSWQ Model Patch Loader (ConvRot INT8 / CPU offload)
+
+<img src="png/Model%20Patch%20Loader.png" alt="HSWQ Model Patch Loader (ConvRot INT8 / CPU offload)" width="400">
+
+ComfyUI loader node for **model patches** (ControlNet, feature projectors, etc.) with **CPU offload** and **ConvRot INT8** support. Loads the model patch directly into VRAM in 8-bit precision (`QuantizedTensor` / `TensorWiseINT8Layout`) and executes via `comfy_kitchen`'s high-speed `int8_linear` kernel with online activation rotation (`convrot`).
+
+Ported from [`ComfyUI-NunchakuFluxLoraStacker`](https://github.com/ussoewwin/ComfyUI-NunchakuFluxLoraStacker)'s `ModelPatchLoaderCustom` ("Model Patch Loader"). Supported model-patch architectures (same dispatch as the stock `comfy_extras.nodes_model_patch.ModelPatchLoader`):
+
+- **Qwen Image block-wise ControlNet** (`controlnet_blocks.0.y_rms.weight`)
+- **SigLIP multi-feature projector** (`feature_embedder.mid_layer_norm.bias`)
+- **Z-Image Fun ControlNet** (`control_all_x_embedder.2-1.weight`)
+
+#### Features
+
+- **Native INT8 VRAM Retention**: Keeps weights in 8-bit precision in VRAM with `TensorWiseINT8Layout`, significantly reducing memory consumption
+- **Fast Execution**: Uses `comfy_kitchen` `int8_linear` GEMM kernel with online activation rotation for ConvRot layers
+- **CPU Offload**: `cpu_offload` toggle builds the model patch in CPU main memory instead of VRAM
+- **Turing-safe compute dtype**: Automatically selects BF16 on Ampere+ GPUs and FP16 on Turing (sm_75) / older GPUs
+- **Drop-in compatibility**: Non-quantized checkpoints load with plain `manual_cast` operations (identical to the stock loader); INT8 `comfy_quant` checkpoints route through `MixedPrecisionOps`
+
+#### Usage Notes
+
+- **Inputs**: `name` (model patch from `models/model_patches`), `cpu_offload` (BOOLEAN, default `True`)
+- **Outputs**: `MODEL_PATCH`
+- **Category**: Loaders (`loaders`)
+- **Apply with stock apply nodes**: `QwenImageDiffsynthControlnet` / `ZImageFunControlnet` / `USOStyleReference`
+- **`cpu_offload` scope**: fully honored end-to-end only for the Z-Image Fun ControlNet path (via `patches/model_patch_cpu_offload.py`); the Qwen block-wise and SigLIP projector apply nodes are not patched
+- **VRAM purge (`clear_model_patches`)**: When using this loader, always ensure **`clear_model_patches`** is turned **ON** (along with **`HSWQ`**) on **General Purge VRAM V2** at the end of the workflow to completely release resident model patch memory and avoid VRAM leaks/OOM on subsequent runs
 
 ### HSWQ Ultimate SD Upscale
 
@@ -142,14 +292,6 @@ Example: input height 1080, `upscale_by = Auto`, `target_height = 4320` → scal
 - **Color Range**: Automatically normalizes Nunchaku SDXL VAE's compressed color range (e.g., 0.15-0.85) to full range (0.0-1.0) to restore proper contrast and color saturation
 - **Module Safety**: Uses isolated module loading to prevent conflicts with other custom nodes
 - **ssitu / UltimateSDUpscale**: Base of the tiled upscale design ([ComfyUI_UltimateSDUpscale](https://github.com/ssitu/ComfyUI_UltimateSDUpscale), GPL-3.0)
-
-#### Tensor Boost (`tensor_boost`)
-
-Optional **`tensor_boost`** BOOLEAN (default **OFF**) for **SDXL ConvRot NVFP4** on NVIDIA Blackwell (SM >= 100: B200 / GB200, RTX 5090 / SM120). When **ON**, enables Per-Weight CUDA Graph acceleration inside `nodes/nvfp4/` and **VRAM use rises by several GB** (CUDA Graph arenas). That headroom is why **RTX 5090 with 32 GB+** is recommended on this upscale path. When **OFF** (recommended for tiled upscale), clears the CUDA Graph cache via `clear_nvfp4_cudagraphs()` and runs Eager Pooled so per-tile shape changes do not stack Graph arenas / blow VRAM / spill to system RAM.
-
-Intended pairing with **HSWQ Sampler**: turn Tensor Boost **ON** for the fixed-resolution base pass, then keep it **OFF** on this upscaler. Loader has no toggle. Details: `md/HSWQ_SDXL_NVFP4_BLACKWELL_ACCELERATION_GUIDE.md`.
-
-**Recommended:** **RTX 5090 with 32 GB VRAM or more** (Tensor Boost ON adds several GB of VRAM; tiled high-res upscale needs that headroom).
 
 #### FP8 (fp8e4m3) and torch.compile
 - **Purpose:** Use this node with FP8 quantized models (e.g. HSWQ SDXL) and torch.compile together.
@@ -224,11 +366,6 @@ In Forge, RES4LYF's `beta/__init__.py` dynamically generates wrapper functions c
 - **Reliable re-injection**: Registers every sampler into both `KSampler.SAMPLERS` (UI selectable) and `comfy.k_diffusion.sampling` via `setattr` (actual inference), guarding against RES4LYF's `importlib.reload()` wiping out function references
 - **Scheduler merge**: Includes ComfyUI's `SCHEDULER_HANDLERS` in addition to the standard scheduler list
 - **`clip_perfect_offload (Krea2 only)`**: Optional toggle that frees the Krea2 text encoder before sampling (see below)
-- **`tensor_boost`**: Optional BOOLEAN (default **OFF**) for Blackwell Tensor Boost on SDXL ConvRot NVFP4 (see below)
-
-#### Tensor Boost (`tensor_boost`)
-
-Optional **`tensor_boost`** BOOLEAN (default **OFF**) for **SDXL ConvRot NVFP4** on NVIDIA Blackwell (SM >= 100: B200 / GB200, RTX 5090 / SM120). When **ON**, enables Per-Weight CUDA Graph auto-dispatch inside `nodes/nvfp4/` for faster fixed-resolution sampling (e.g. 1024×1024) and **VRAM use rises by several GB**. When **OFF**, clears graphs and uses Eager Pooled (no Graph-arena stack). Controlled via `HSWQ_NVFP4_TENSORBOOST` / `HSWQ_NVFP4_CUDAGRAPH`. Does **not** affect Z Image / INT8 / FP8 / stock paths. The Checkpoint Loader has no toggle — only this sampler and **HSWQ Ultimate SD Upscale**. Details: `md/HSWQ_SDXL_NVFP4_BLACKWELL_ACCELERATION_GUIDE.md`.
 
 #### Krea2 text-encoder offload (`clip_perfect_offload`)
 
@@ -248,14 +385,13 @@ The feature is deliberately narrow and safe:
 - **Category**: `sampling`
 - **Extensibility**: Designed as a thin UI wrapper so future HSWQ / Z-Image quantized-inference arguments can be intercepted in `sample()` without patching the ComfyUI core
 - **Krea2 TE offload**: Leave `clip_perfect_offload (Krea2 only)` off for every non-Krea2 model; turn it on for Krea2 to reach bench-parity VRAM. For old workflows the pre-rename key `clip_perfect_offload` still maps to the same toggle.
-- **Tensor Boost**: Prefer **ON** for the base SDXL ConvRot NVFP4 pass on Blackwell (**several GB more VRAM**); keep **OFF** on **HSWQ Ultimate SD Upscale** during tiles. This sampler: **16 GB VRAM or more**. Upscale / Tensor Boost headroom: **RTX 5090 32 GB+**.
-- **Details**: See `md/hswq_sampler_technical_reference.md`, `md/HSWQ_KREA2_TE_OFFLOAD_GUIDE.md`, and `md/HSWQ_SDXL_NVFP4_BLACKWELL_ACCELERATION_GUIDE.md`
+- **Details**: See `md/hswq_sampler_technical_reference.md` and `md/HSWQ_KREA2_TE_OFFLOAD_GUIDE.md`
 
 ### HSWQ Torch Compile
 
 <img src="png/torchcompile.png?v=2" alt="HSWQ Torch Compile" width="400">
 
-ComfyUI node that wraps a loaded **MODEL** with PyTorch `torch.compile` for HSWQ diffusion paths (SDXL ConvRot INT8 / ConvRot NVFP4, Z Image / ZIT ConvRot NVFP4, and related USDU / Distorch workflows).
+ComfyUI node that wraps a loaded **MODEL** with PyTorch `torch.compile` for HSWQ diffusion paths (SDXL ConvRot INT8, Z Image / ZIT ConvRot NVFP4, and related USDU / Distorch workflows).
 
 **Provenance:** This node was developed based on **[ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)** `TorchCompileModelAdvanced` (kijai), with original improvements and features added for HSWQ / USDU / Distorch / Windows inductor hardening. At runtime it calls ComfyUI core `comfy_api.torch_helpers.set_torch_compile_wrapper` and does **not** import the KJNodes package; that does **not** remove the copyright / GPL obligation to the KJNodes original.
 
@@ -278,7 +414,7 @@ On Windows, other extensions (for example SeedVR2) may raise inductor `compile_t
 - **Inputs**: `model` (MODEL), `backend`, `fullgraph`, `mode`, `dynamic`, `compile_transformer_blocks_only`, `dynamo_cache_size_limit`, `force_parameter_static_shapes`, `patch_distorch_weight_cast`, `debug_compile_keys`; optional `disable_dynamic_vram`
 - **Outputs**: MODEL (compiled clone)
 - **Category**: `HSWQ/torchcompile`
-- **Placement**: After **HSWQ Checkpoint Loader (SDXL)** or **HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader** (and any LoRA), before the sampler / **HSWQ Ultimate SD Upscale**
+- **Placement**: After **HSWQ Checkpoint Loader** or **HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader** (and any LoRA), before the sampler / **HSWQ Ultimate SD Upscale**
 - **Avoid `cudagraphs` with multi-tile USDU**: Prefer inductor; CUDA graphs often fail on tiled / pool allocation paths
 - **KJNodes**: Base of the torch.compile UI / wrapper design (GPL-3.0). Installing KJNodes is **not** required to run this node; attribution and GPL obligations still apply
 - **Details**: See `md/HSWQ_TORCH_COMPILE_AND_ZI_INT8_PEEL_GUIDE.md`
@@ -313,9 +449,10 @@ This project is licensed under the **GNU General Public License, Version 3**.
 * **HSWQ Ultimate SD Upscale** (`usdu_bundle/`, `nodes/nunchaku_usdu.py`, related USDU patches) was developed based on [ComfyUI_UltimateSDUpscale](https://github.com/ssitu/ComfyUI_UltimateSDUpscale) (ssitu, GPL-3.0), with original improvements and features added. Copyright in the ssitu original is retained; original work in this repository is © ussoewwin
 * **HSWQ Torch Compile** (`nodes/hswq_torch_compile.py`) was developed based on ComfyUI-KJNodes torch.compile nodes ([ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes), GPL-3.0), with original improvements and features added. Copyright in the KJNodes original is retained; original work in this repository is © ussoewwin. That KJ provenance does **not** apply to the HSWQ quantization method itself
 * **HSWQ Batched Detailer (SEGS)** (`nodes/hswq_batched_detailer.py`, `nodes/batched_detailer_lib/`) was developed based on [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack) Detailer (SEGS) (ltdrdata, GPL-3.0), with original improvements and features added **especially to maintain HSWQ compatibility**. Copyright in the Impact Pack original is retained; original work in this repository is © ussoewwin. Installing Impact Pack is **not** required at runtime for this node
+* **HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader (DisTorch2)** (`distorch/distorch_2.py`, `nodes/hswq_unet_distorch2.py`) was developed based on [ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU) (pollockjj, GPL-3.0), with original improvements and features added. Copyright in the ComfyUI-MultiGPU original is retained; original work in this repository is © ussoewwin. The ported files are modified copies of the upstream code (GPL-3.0 section 5a notice)
 * You are free to **use, modify, and distribute** this software under GPL-3.0 terms.
 * When you distribute this software or a modified version, you **must**:
-  * Keep the copyright and license notices (including third-party / derived-work notices such as ssitu UltimateSDUpscale, KJNodes, and Impact Pack)
+  * Keep the copyright and license notices (including third-party / derived-work notices such as ssitu UltimateSDUpscale, KJNodes, Impact Pack, and ComfyUI-MultiGPU)
   * Provide the corresponding source code
   * License the distributed work under **GPL-3.0** (reciprocal / share-alike terms)
 * This software is provided **"AS IS"**, without warranties or conditions of any kind.

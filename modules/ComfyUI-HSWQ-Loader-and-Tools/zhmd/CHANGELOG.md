@@ -7,6 +7,165 @@
   </tr>
 </table>
 
+## Version 3.6.5
+
+- 添加：**SD1.5 ConvRot INT8 支持** -- SD1.5 ConvRot INT8 技术栈登陆加载器：专用内置模块 `nodes/sd1.5 int8/` 把在 HSWQ 仓库基准栈中开发、生产实测验证过的 SD1.5 技术栈移植进加载器，并为 **HSWQ Checkpoint Loader** 节点新增 **`SD1.5 ConvRot INT8`** `weight_dtype` 选项：
+  - **全技术栈移植**：Triton 融合 ConvRot W8A8 IMMA Conv2d（`_int8_conv_rot_imma`，quant/dequant 核 + Hadamard 激活旋转）、INT8 linear（cuda/triton/eager 阶梯，经 `comfy_kitchen`）、Conv2d/LoRA/ControlLora/handoff 加载补丁、INT8 探测（`checkpoint_looks_like_comfy_quant_int8`）与 SD1.5 graph-arm_disabled 基准开关 -- 合并时与基准主干 byte 完全一致（4 副本 SHA256 校验，unique=1）。
+  - **CUDA graph replay 执行器**：全 denoiser `_Sd15CudaGraphExecutor` 由 SD1.5 加载路径激活（含 staticize-for-capture、fail-fast arm、per-capture triton fallback）。在默认 caching allocator 下在捕获图内重放融合 triton ConvRot 核；子进程带上剥除 `backend:cudaMallocAsync` 的环境启动（async pool 拒绝 capture 内的 triton 启动 -- 实测）。
+  - **Double-arm 防护**：SD1.5 技术栈可能在不同模块名下被导入（loader + hook 副本），base 对象标志 `_hswq_sd15_graph_armed` 保证每个模型无论 import 别名都只激活一次 -- 缺少防护时，实测双重包裹使 capture 失效（cudaErrorStreamCaptureUnsupported 900 -> 100% NaN 采样）。
+  - **SD1.5 的 CLIP 保持 FP16**：SD1.5 pack 内置的 CLIP 以 FP16 保存（SD1.5 的 ConvRot INT8 CLIP 阶段在生产调试后放弃；与 FP16 基线的 conditioning 对比实测 cos 0.99987）。SDXL 的 CLIP INT8 完全未动。
+  - **实测（production，512x512，RTX 5060 Ti）**：INT8 稳态 17.18-17.34 it/s vs FP16 15.03-15.22 it/s（**定常 +14.5%**），seed 均值 wall-clock FP16 1.72s vs INT8 1.50s（**+12.8%**），triton 失败 0，capture-fallback 0。
+- 查看 [发布说明 v3.6.5](v3.6.5.md)
+
+## Version 3.6.4
+
+- **新增**：**SDXL ConvRot INT8 CUDA Graph 重放（CUDA-Graph Replay）集成** —— 将来自 SD1.5 INT8 技术栈的去噪器级 CUDA Graph 重放基础设施（`_Sd15CudaGraphExecutor`）正式移植集成至 SDXL ConvRot INT8 运行时，彻底消除了 Pooled 激活旋转优化后残留的逐算子 CPU 发射（launch-bound）开销：
+  - **执行器与架构隔离**：集成于独立的 SDXL 专用模块 `nodes/sdxl_convrot_int8/sdxl_convrot_fast.py`（359-500 行），并通过非 `sys.modules` 的私有加载器按需加载，绝不污染或影响其他模型系列（Z Image / Krea2 / FLUX / SAM3 / SD1.5）。基于完整输入签名（排序的张量键集合）管理逐 `(x, t, context)` CUDA Graph，每次重放前严格拷贝输入缓冲区并克隆独立输出。覆盖最大潜空间边长 `_MAX_CAPTURE_LATENT_SIDE = 128`（1024x1024）；超大尺寸自动走 eager 执行。
+  - **Graph-First 加载阶梯**：`patches/comfy_quant_int8.py` 中的 Checkpoint Loader（`load_checkpoint_sdxl_hswq_weight_dtype`）与 UNet Loader（`load_diffusion_model`）分支均优先尝试启用图重放（`_arm_sdxl_cudagraph`），并在图装载失败或异常时自动无缝降级至 Eager Pooled 旋转路径。架构判定适配 v2.14-comfy，同时兼容 `dm.adm_in_channels` 与 `inner.adm_channels`（SDXL=2816）。
+  - **捕获期 Pooled 缓冲区防污染守卫**：彻底解决共享缓冲区在图重放时的严重数值污染问题（实测 maxdiff 2.3-4.0）。通过 `_STATE["in_graph_capture"]` / `_capture_active()` 状态标志，在预热、捕获及重放数据拷入期间强制回退至纯净（非 pooled）的标准旋转，确保录制的 CUDA Graph 保持标准算子内核与 bit-equal 完全一致，而在图不可捕获的 eager 步中仍保留 pooled 缓冲区的加速收益。
+  - **AST 审计更新**：针对 v2.14-comfy 中新增的 `backends/ascend/__init__.py` 旋转调用点补充了 AST 闭环审计规则，确保各后端调用点均通过严格的安全消费契约校验。
+  - **实测表现**：在 1024x1024 反向混合量化参考包的 25-seed 潜空间轨迹对比中：定常速度由 2.60-2.76 it/s（FP16 eager）提升至 **3.35-3.36 it/s（INT8 graph replay，提升 +22.1%）**，平均单图耗时由 9.23s 缩短至 **7.62s/seed（提升 +17.5%）**，且输出**完全 Bit-identical（final cosine mean 0.96223，0/25 分叉）**。
+- 详见 [发布说明 v3.6.4](v3.6.4.md)
+
+## Version 3.6.3
+
+- **新增**：**SDXL ConvRot INT8 CLIP 支持** —— 现在可将检查点内嵌的 SDXL 文本编码器（CLIP-L `conditioner.embedders.0` 与 CLIP-G `conditioner.embedders.1`）量化为 **ConvRot INT8** 并在 ComfyUI 中正确加载：
+  - **加载器**：`nodes/sdxl_convrot_int8/sdxl_clip_quant.py`（SDXL 专用）使文本编码器加载路径消费 CLIP 量化元数据（`te_model_options["quantization_metadata"]`），将 CLIP-G 的伴随键（`.comfy_quant` / `.weight_scale`）重映射为 `transformers_convert` 赋予权重的 HuggingFace 布局，并按 FP16 路径补全检查点中缺失的 `clip_l.text_projection`（全零）。仅由 `SDXL ConvRot INT8` 加载分支启用；按路径加载，绝不被其他系列 import。
+  - **转换脚本**：`hswq/sdxl/quantize_sdxl_clip_int8.py` —— 基于规则的 **FP16 保护**集（保持 FP16），其余为完整 ConvRot INT8。保护集与模型无关，经四个 SDXL 检查点实测一致：CLIP-L `embeddings.token_embedding` / `embeddings.position_embedding` / `encoder.layers.0.mlp.fc1` / `encoder.layers.0.mlp.fc2`；CLIP-G `token_embedding` / `transformer.resblocks.*.mlp.c_proj`（全部）/ `transformer.resblocks.{2,29}.attn.out_proj`。
+  - **实测**：在保护集下，SDXL CLIP INT8 与 FP16 CLIP 在统计上不可区分 —— 25 seed 潜空间轨迹对比 FP16 基线：**mean final-cos 0.96223（CLIP INT8）vs 0.96230（CLIP FP16），0/25 分叉**，INT8 快 +17.2%（9.37s -> 7.75s/seed，1024x1024）。
+  - **为何 SDXL（与 SD1.5）需要此支持而 Krea2 / Z Image 不需要**：Krea2 / Z Image 使用的 Llama 系文本编码器在 `llama_detect` 内部检测量化；而 SDXL / SD1.5 的 CLIP 类没有自检测，必须在加载器侧注入元数据。
+- 详见 [发布说明 v3.6.3](v3.6.3.md)
+
+## Version 3.6.2
+
+- **移除**：**彻底移除 Tensor Boost（Blackwell CUDA Graph）功能与运行时代码** —— 继 v3.6.1 终止 SDXL NVFP4 开发后，此前专为 SDXL NVFP4 设计的 CUDA Graph 加速机制 Tensor Boost 已无存在必要，本次更新进行了全方位的彻底清理：
+  - **节点 UI**：从 `HSWQ Sampler`（`HSWQSampler`）与 `HSWQ Ultimate SD Upscale`（`HSWQUltimateSDUpscale`）节点中彻底移除了 `tensor_boost` 开关部件。
+  - **文档说明**：从 `README.md` 与 `zhmd/README.md` 中全面清理了所有关于 Tensor Boost 的说明段落、性能表格及 RTX 5090 开启建议。
+  - **运行时与底层代码**：彻底删除了 `nodes/sdxl_convrot_nvfp4/` 下的 CUDA Graph 捕获与重放基础设施（共删除 523 行代码，涉及 `nvfp4_runtime.py`、`nvfp4_forward.py`、`nvfp4_conf.py`、`comfy_quant_nvfp4.py`），包括形状共享图缓存、逐权重图缓存、静态缓冲区拷贝逻辑以及 `is_nvfp4_cudagraph_enabled()`。历史 SDXL NVFP4 模型的推理执行直接运行在稳定轻量的 Eager Pooled GEMM 路径上，彻底消除了显存图静态膨胀与 CUDA 图异常风险。
+- 详见 [发布说明 v3.6.2](v3.6.2.md)
+
+## Version 3.6.1
+
+- **移除**：**SDXL ConvRot NVFP4 开发终止 / 移除 UI 选项与评测脚本** —— 从 `HSWQ Checkpoint Loader (SDXL)`（`HSWQCheckpointLoaderSDXL`）节点的 `weight_dtype` 下拉菜单中移除了 `ConvRot NVFP4` 选项，并删除了 SDXL NVFP4 专用评测脚本 `nodes/nvfp4bench_sdxl.py`（594 行）。上游确定性潜空间轨迹测试表明，4-bit 精度（NVFP4）在 SDXL 上无法保证潜空间轨迹一致性（最终轨迹余弦均值未达 0.90，旧版 SSIM ~0.95 实受 VAE 解码掩盖）；SDXL 正式转为全面专注于 **ConvRot INT8（reverse hybrid）**。为保持对已发布历史模型的向后兼容性，`weight_dtype="default"` 时的 `checkpoint_looks_like_comfy_quant_nvfp4` 自动检测机制依然保留。同时，原共享包 `nodes/nvfp4/` 重命名为 SDXL 专用包 `nodes/sdxl_convrot_nvfp4/`，Z Image NVFP4 相关代码亦统一归拢至自闭环包 `nodes/zimage_convrot_nvfp4/`。
+- 详见 [发布说明 v3.6.1](v3.6.1.md)
+
+## Version 3.6.0
+
+- **移除**：**Krea2 ConvRot NVFP4 支持终止 / 代码删除** -- 从 UNet 加载器（普通版 + DisTorch2 版共用选项表）移除 `Krea2 ConvRot NVFP4` `weight_dtype` 选项；删除 `nodes/krea2_convrot_nvfp4/load_unet.py`（182 行）与 `nodes/krea2_convrot_nvfp4/nvfp4_comfy_parity.py`（178 行）；包重命名 `nodes/krea2_convrot_nvfp4/` -> `nodes/krea2_convrot_int8/`；删除该包中 8 个 NVFP4 专用模块（`int8_load` 236 / `int8_conf` 264 / `int8_gemm` 316 / `int8_runtime` 616 / `int8_tc_gate` 129 / `int8_addmm_patch` 111 / `int8_hadamard` 194 / `kitchen_quant_ops_repair` 435 行）；并从保留的 3 个模块（`comfy_quant_int8_krea2.py`、`int8_forward.py`、`int8_lora_bake.py`）中剥离 NVFP4 专用代码路径（`apply_comfy_quant_nvfp4_patches` 更名 `apply_comfy_quant_int8_patches`）—— 两次删除提交合计删除 3,896 行。保留模块现仅服务 **Krea2 ConvRot INT8**（stock INT8 forward + 低秩 LoRA 残差；共享 peel 标记 `_hswq_nvfp4_stack_ver=2` / `_hswq_nvfp4_orig_mp` / `_hswq_nvfp4_full_forward` 为 SDXL / Z Image peel walker 保留）。SDXL ConvRot INT8、SDXL ConvRot NVFP4、Z Image INT8、Z Image ConvRot NVFP4：**0 字节变更**（以 git blob 哈希对比 v3.5.9 与 HEAD 实测，`nodes/nvfp4/`、`nodes/zimage_nvfp4/`、`nodes/sdxl_int8/` + INT8 loader 节点共 27 个文件）。
+- 详见 [发布说明 v3.6.0](v3.6.0.md)
+
+## Version 3.5.9
+
+- **恢复**:**恢复 v3.4.8 中删除的 SAM3 节点** -- 从 v3.4.7 的 git 历史忠实复现:`HSWQ SAM3 Loader (ConvRot INT8)`(`HSWQSAM3Loader` / `HSWQLoadConvRotINT8SAM3`)与 `HSWQ SAM3 Detect`(`HSWQSAM3Detect`,输出 `masks` / `bboxes` / `image`),并包含 `png/sam3.png` 与 `__init__.py` 节点注册。`patches/comfy_quant_int8.py` 中的 SAM3 INT8 加载补丁此前一直保持生效,因此本次仅恢复了节点文件与注册。
+- 详见 [发布说明 v3.5.9](v3.5.9.md)
+
+
+- **移除**：**从 UNet Loader 中移除 `attention_accel` 选项** —— 从 `HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader`（`HSWQFP8E4M3UNetLoader`）节点中移除了 `attention_accel` 下拉菜单部件（`default` / `sa2`）及内置的 SageAttention2 注入逻辑。注意力加速逻辑解耦后更适合通过专用的外部补丁节点（例如 `Patch Sage Attention`）灵活处理。同时完全保留向后兼容性：包含旧版 `attention_accel` 参数的已保存工作流通过关键字参数（`**kwargs`）自动吸收，仍可无缝直接运行。
+- 详情见 [发布说明 v3.5.8](v3.5.8.md)。
+
+## Version 3.5.7
+
+- **修复**：**ComfyUI v0.38 fast-disk 原生读取崩溃/失效** -- v0.38 将 comfy-aimdo 存储读取迁移到 fast-disk 专用路径，跨线程调用原生读取会崩溃或静默失败。新增 prestartup 守卫（patches/comfy_aimdo_fastdisk_guard.py）：把全部原生 aimdo 读写绑定到单一 owner 线程、原生调用在调用线程上直跑（不经队列跳转）、图捕获读取保持 inline、卡死的读取槽自动复位、原生路径失败回退 mmap -- 恢复 v0.36 级稳定性，fast-disk 保持启用。
+- **新增**：**Distorch HSWQ purge 的清除闸门复位 API** -- patches/hswq_purge_rearm.py 新增 hswq_purge_rearm_state()；DisTorch purge（DisTorchPurgeVRAMV2 Method 2d）为模型交接剥离 HSWQ 叠层后，各家族残留的模块级 apply 闸门被复位，下一个 prompt（Z Image ConvRot NVFP4 / Qwen + ControlNet ConvRot INT8 / Krea2 / SDXL）在同一进程内干净重载，不再继承被剥离的状态。消除连续 prompt 交替出坏图的竞态。
+- **新增**：**DiT 量化权重锁改为节点补丁** -- DiT quant-lock 守卫从 comfy/ops.py 核心改动（每次 ComfyUI 更新都会丢失）迁移到 patches/comfy_dit_quant_lock.py，经 prestartup 钩子在导入时安装并做锚点校验。ComfyUI 更新后无需再改核心文件。
+- **修复**：**Lumina2 在 Blackwell（sm_120）上崩溃** -- comfy_kitchen 的 rms_rope 无 sm_120 内核；patches/comfy_quant_int8.py 改为安装安全 fallback，不再让 C++ 后端直接 abort 进程。
+- 详细见 [发行说明 v3.5.7](v3.5.7.md)。## Version 3.5.6
+
+- **修复**：**CPU 文本编码器路径上的 INT8 Linear dtype 不一致** —— 使用 `comfy_kitchen` **0.2.36**（ComfyUI 2026-09-30）时，`TensorWiseINT8Layout.dequantize()` 现在会把反量化后的张量恢复为 **`params.orig_dtype`**（bfloat16）。而 `patches/comfy_quant_int8.py` 中 HSWQ 的 INT8 **非对齐 GEMM 回退**会把 **bfloat16 权重** 连同 **float32 激活** 传给 `torch.nn.functional.linear()`，抛出 `self and mat2 must have the same dtype, but got Float and BFloat16`。当 CLIP/文本编码器运行在 **CPU** 时触发（例如 `CLIPLoaderMultiGPU` 设 `device=cpu` —— 已在 Qwen-Image ConvRot INT8 文本编码器上复现）。现在回退在调用 `F.linear` 之前会把 weight/bias 转换为解析出的 `out_dtype`（激活 dtype）。**仅 CPU 回归**：CUDA 对齐路径走真正的 `int8_linear` 内核，从不受影响；INT8 权重仍以 INT8 常驻 VRAM，只有回退路径会反量化。
+- 详情见 [发布说明 v3.5.6](v3.5.6.md)。
+
+## Version 3.5.5
+
+- **修复**：**comfy_kitchen 0.2.36 下 INT8 Linear 崩溃** —— `comfy_kitchen` 0.2.36（2026-09-30）为 `backends.cuda.int8_linear` 新增了 `input_act_weight` / `input_act_eps` / `residual` / `residual_scale` 四个参数，ComfyUI 本体 `comfy/ops.py`（`linear_input_act`）已改为传入它们。而 HSWQ 的未对齐 GEMM 回退包装器仍保留旧的 8 参数签名，导致每次 INT8 Linear 调用都抛出 `TypeError: _safe_cuda_int8_linear() got an unexpected keyword argument 'input_act_weight'`（已在 Z Image / Lumina2 ConvRot NVFP4 LoRA + USDU 路径复现）。`patches/comfy_quant_int8.py` 中的包装器现可接收这四个新参数以及 `**extra_kwargs`，并仅转发已安装 `int8_linear` 实际声明的参数（通过 `inspect.signature` 探测），因此新旧 `comfy_kitchen` 均可正常工作。反量化回退路径现也像原生算子一样应用 `input_act` 与 `residual`。INT8 权重仍以 INT8 常驻 VRAM，仅未对齐路径会反量化，行为与以往一致。
+- 详情见 [发布说明 v3.5.5](v3.5.5.md)。
+
+## Version 3.5.4
+
+- **新增**：**HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader (DisTorch2)** —— UNet 加载器的 DisTorch2 版本（后端移植自 [ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU)，GPL-3.0），可将**整个 UNet** 放到显存之外（virtual VRAM + donor device，例如 `cpu`）。当前仅验证 **Krea2 ConvRot INT8**；面向**将来开发的大尺寸 HSWQ ConvRot NVFP4**。
+- 详情见 [发布说明 v3.5.4](v3.5.4.md)。
+
+## Version 3.5.3
+
+- **修复**：**Krea2 文本编码器（Qwen3-VL-4B）ConvRot INT8 在图像条件编码时崩溃** —— `NoCapableBackendError: No backend can handle 'dequantize_int8_embedding': eager: q: dtype torch.float16 not in {torch.int8}`。ComfyUI 的 `cast_bias_weight()` CPU 分支（动态 VRAM 加载下生效：模块带有 `_v` 且目标设备为 CPU）会把**已经反量化后的 fp16 表**交给量化 `Embedding` 的 forward，而 `int8_tensorwise` 分支仍将其送入 INT8 的 `TensorWiseINT8Layout.dequantize_embedding` gather，其 `comfy_kitchen` 后端要求 `q` 为 int8。现在 `patches/comfy_quant_int8.py` 会在 `_patch_comfy_kitchen_int8_gemm_fallback()` 内安装安全的 `dequantize_embedding` 替换：真正的 int8/uint8 存储仍委派给原生 kitchen 算子（正常路径与性能完全不变），非 int8（已反量化）表则直接按行 gather，不再重复应用 scale/ConvRot。该修复是通用健壮性回退而非特定模型专属：覆盖任何经由该 CPU 分支到达的 `int8_tensorwise` 嵌入（Krea2/Qwen3-VL 的 `visual.pos_embed`、语言模型的 `embed_tokens` 等），不含 INT8 嵌入的模型不受影响。
+- 详情见 [发布说明 v3.5.3](v3.5.3.md)。
+
+## Version 3.5.2
+
+- **新增**：**SDXL ConvRot INT8 内核快速路径** —— SDXL ConvRot INT8 的 Linear/Conv2d 路径改为使用**池化输出缓冲区**旋转激活（`torch.matmul(..., out=)`，使用激活自身的 dtype，不再提升到 fp32），并关闭 **CUDA fused ConvRot 内核**。该快速路径**仅限 SDXL 且完全分离**：实现位于专用模块 `nodes/sdxl_int8/sdxl_convrot_fast.py`；`patches/comfy_quant_int8.py` 仅新增一个 SDXL 判定函数、一个私有（不注册到 `sys.modules`）加载器与两处 SDXL 门控调用；`nodes/native_convert_int8.py` 无任何改动。内核仅在被 arm 的 SDXL forward 期间替换，并在 `finally` 中恢复为完全相同的对象；若已安装的 `comfy_kitchen` 调用点与审计模式不符，fail-closed 调用点审计将**拒绝对该模型 arm**。Z Image / Krea2 / FLUX / SD1.5 / SAM3 / ControlNet / Qwen 以及所有 NVFP4 路径均不受影响（对它们而言该模块从不被 import 或加载）。
+- 详情见 [发布说明 v3.5.2](v3.5.2.md)。
+
+## Version 3.5.1
+
+- **新增**：**UNet Loader 的 SageAttention2（SA2）加速** —— **HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader** 新增 **`attention_accel`** 选项（`default` / `sa2`）。
+  - **`default`**：ComfyUI 原生 attention，不安装任何补丁 —— 与既往版本完全一致。
+  - **`sa2`**：将已加载模型的 attention 替换为 **SageAttention2**（`sageattn`，INT8 QK `per_warp` + FP8 PV，sm120 自动路径）。mask 与 `head_dim > 256` 自动回退到 SDPA；内核失败按每次调用回退，覆盖率以 `[HSWQ SA2] attention calls: total=... sa2=... errors=...` 输出。
+- **支持模型（4 种模式，分别独立分发）**：**Z Image ConvRot INT8**、**Z Image ConvRot NVFP4**、**Krea2 ConvRot INT8**、**Krea2 ConvRot NVFP4**。模式由检查点本身判定（comfy_quant `int8_tensorwise` / `nvfp4` 扫描 + Krea2 `txtfusion.projector` 标记），再与所选的 `weight_dtype` 交叉校验，并在安装前再次校验已加载模型的类。不一致时**拒绝安装 SA2** 并记录警告，绝不混用模式。
+  - **按模型启用**：SA2 仅在该 MODEL 的 forward 执行期间生效；同一图中的其他模型保持原生 attention。
+  - **实测**：attention 内核约快 **2.3x**；端到端 **-11.4%**（Z Image ConvRot INT8）与 **-15.4%**（Z Image ConvRot NVFP4）（RTX 5060 Ti），bifurcated `0/20`。
+- **不支持**：**SDXL**（`HSWQ Checkpoint Loader (SDXL)`）没有 `attention_accel` 选项，也没有 SA2 代码路径 —— 仅限 Z Image / Krea2。
+- **注意**：**不要**与 `Patch Sage Attention DM`（ComfyUI-DistorchMemoryManager）叠加 —— 两者都会补丁 attention。使用 `attention_accel=sa2` 时请旁路该节点。需要 `sageattention` 包（仅在选择 `sa2` 时导入）。
+- 详情见 [发布说明 v3.5.1](v3.5.1.md)。
+
+## Version 3.5.0
+
+- **新增**：**HSWQ Model Patch Loader（`HSWQModelPatchLoaderCustom`）** - 加载模型补丁（ControlNet、feature projector 等），支持 **CPU offload** 与 **ConvRot INT8**。权重在 VRAM 中保持 INT8（`QuantizedTensor` / `TensorWiseINT8Layout`，comfy-kitchen `int8_linear` 在线 ConvRot 旋转）；`cpu_offload` 可在 CPU 内存中构建补丁；计算 dtype 自动选择 BF16（Ampere+）/ FP16（Turing）。移植自 ComfyUI-NunchakuFluxLoraStacker 的 `ModelPatchLoaderCustom`；可与标准 apply 节点（`QwenImageDiffsynthControlnet` / `ZImageFunControlnet` / `USOStyleReference`）配合使用。
+- **修复**：**SAM3 / SAM3.1 ConvRot INT8 支持恢复** - 恢复 comfy_kitchen INT8 非对齐 GEMM 回退（K/N 非 4 的倍数维度的层（如 SAM3 `boxRPB_embed_x` K=2）自动反量化回退到 float，不再导致 `cublas_gemm_int8` 崩溃；权重仍以 INT8 保存在 VRAM），以及 SAM3 加载补丁：`process_clip_state_dict` 对预分割 `language_backbone` 键的重映射（修复 "clip missing" -> 文本嵌入损坏 -> 空/黑掩膜）与 SAM3 门控的 `load_state_dict_guess_config` 处理（CLIP/Conv2d 键反量化，所有 Linear 层保持真 INT8）。标准 Comfy SAM3/SAM3.1 节点现在可以正确加载 ConvRot INT8 检查点（已在 SAM3 与 SAM3.1 上验证）。
+- 详情见 [发布说明 v3.5.0](v3.5.0.md)。
+
+## Version 3.4.9
+
+- **改进**：**HSWQ ControlNet Loader (`HSWQControlNetLoader`) 动态计算 Dtype 适配，全面兼容 Turing (sm_75) 及旧代 GPU** —— 解决了在缺乏原生 BF16 硬件 Tensor Core 的 NVIDIA Turing（RTX 2000 / GTX 1600 系列）及更早架构上可能发生的 BF16 运行时错误与隐式 FP32 升精度开销。
+  - **动态架构检测**：利用 `comfy.model_management.should_use_bf16()`，在现代 GPU（Ampere / Ada / Blackwell）上自动采用 `torch.bfloat16`，在 Turing / Pascal 架构上安全采用 `torch.float16`。
+  - **无损 INT8 显存节省**：量化权重在显存中严格保持 8-bit（`TensorWiseINT8Layout`），避免无谓的 FP32 显存膨胀，并在所有 GPU 世代上均能实现最大化的显存缩减效果。
+  - **完全向后兼容**：节点输入输出接口与现有工作流完全保持不变；非量化及 FP8 回退路径完全透明。
+- 详情见 [发布说明 v3.4.9](v3.4.9.md)。
+
+## Version 3.4.8
+
+- **移除**：**HSWQ SAM3 Loader（ConvRot INT8）与 HSWQ SAM3 Detect 节点** - SAM3 节点相关代码（加载器、检测节点、补丁、指南）已从树中移除。经测试（及 r/StableDiffusion 社区确认）证明**专用加载器并非必需**：启动时补丁（`_patch_load_state_dict_guess_config_int8` 的 `is_sam3` 门控）已能让标准加载器（`CheckpointLoaderSimple` / 默认 Comfy SAM3.1 节点）自动处理 ConvRot INT8 SAM3 检查点，包括 MixedPrecisionOps 附加与 CLIP 键重映射。树已恢复到基线 `d33862a`（`191ddbc`）；全部技术工作（补丁、节点、技术指南）仍保留在 git 历史中供参考。
+- 详情见 [发布说明 v3.4.8](v3.4.8.md)。
+
+## Version 3.4.6
+
+- **修复**：**SDXL anytest LoRA 型 ControlNet（ControlLora）在 ConvRot INT8 / Hybrid ConvRot NVFP4 基座上的失效与不染色问题** —— 两阶段根治（症状：先是控制完全无效，之后输出被锁定为线稿 —— 黑白、不染色、强度滑块失效）：
+  - **ControlLora 借用权重反量化 v3**（`c60bb0b`，`patches/comfy_quant_int8.py` + `__init__.py`）：`ControlLora.pre_run` 会将基座 UNet 的 state_dict 借入浮点 control model；量化基座下这些权重是坏的 —— comfy-kitchen 的 ConvRot 反量化仅支持 2D（4D Conv2d 抛 `NoCapableBackendError` → 回退为原始 ±127 qdata），且 HSWQ 武装的 Conv2d 权重处于旋转基（`qt.dequantize()` 成功但得到 W_rot）。v3 wrapper 现在按模块反量化（qdata × scale）并对 4D Conv2d 做逆旋转，并在启动时无条件安装。
+  - **`HSWQCheckpointLoaderSDXL` INT8 路由**（`152c1dc`，`__init__.py`）：节点此前直接调用 `load_checkpoint_guess_config` 并忽略 `weight_dtype="int8_tensorwise"`。ConvRot INT8 checkpoint 的 Conv2d 量化层以原始 int8 qdata + `weight_scale` + `comfy_quant` sidecar（groupsize 64）存储；未走 INT8 Conv2d 加载作用域时保持为原始 ±127 —— 基座 UNet 前向崩溃（NaN），ControlLora 控制输出爆炸 `[731, 123352, 183752, NaN]` → 输出被锁定为线稿。节点现在将 int8_tensorwise（或自动检测的 comfy_quant INT8）委托给 INT8 感知的 `load_checkpoint_sdxl_hswq_weight_dtype`；同时修复 `_unrotate_conv2d` 中 Hadamard 矩阵的设备不匹配（采样时 `ControlLora.pre_run` 内的 CPU/CUDA 崩溃）。
+  - **文档**：`md/HSWQ_SDXL_ANYTEST_CONTROLLORA_CONVROT_INT8_NVFP4_FIX_GUIDE.md` 重写为 v2（根本原因、代码、验证：控制范数正常 `[720, 1229, 1415, 1553]`、端到端彩色生成 sat 73.5、结构 L1 0.299）。
+- **变更**：HSWQ ControlNet Loader 更名为 `HSWQControlNetLoader`，带别名（`HSWQLoadConvRotINT8ControlNet`）并归入 `loaders` 分类（`d208c58`）。
+- 详情见 [发布说明 v3.4.6](v3.4.6.md)。
+
+## Version 3.4.5
+
+- **修复**：**Z Image tcon（TC/W4A4）NVFP4 在 DisTorch HSWQ 完整 purge 后的第 2 次生成噪声** —— purge 后第 2 次生成时 bake 结果为 `nvfp4_baked=0 other_qt_baked=83`（NVFP4 层被误判为 `other_qt`，跳过 ConvRot 逆旋转/再旋转），产生噪声。两部分根治：
+  - **`_load_wrap_ok` 门控**（`nodes/zimage_nvfp4/zi_comfy_quant_nvfp4.py` 的 `apply_comfy_quant_nvfp4_patches()`）：early-return 现在还会校验可被 purge 剥离的 `ops._load_quantized_module` 包装是否仍处于武装状态（`_hswq_nvfp4_full_load` 标记）。若 purge 已剥离包装，则不再信任过期的 `_PATCHES_APPLIED` 标记，而是落入完整重新应用路径（重新包装 + `arm_nvfp4_module`），使重载时 `_hswq_nvfp4_convrot` 重新武装，NVFP4 层恢复正确 bake。
+  - **`_install_permanent_dynamic_load_guard()`**（`nodes/zimage_nvfp4/load_unet.py`）：一个永久的 `ModelPatcherDynamic.load` 外层守卫，**不带** `_hswq_zi_nvfp4_lora_bake` 标记，因此 purge 深度清理会绕过它；每次 `Dynamic.load` 都会通过 `_ensure_dynamic_load_bake_wrap()` 重新武装 ConvRot NVFP4 LoRA bake 钩子（已武装时为 no-op）。
+  - **文档**：`md/HSWQ_TCON_NVFP4_SECOND_GEN_NOISE_FIX.md` —— 以 `1156f00` 为基线的完整指南（问题、根本原因、文件、完整代码、代码含义）。
+- 详情见 [发布说明 v3.4.5](v3.4.5.md)。
+## Version 3.4.4
+
+- **新增**：**HSWQ ControlNet Loader (ConvRot INT8)**（`HSWQControlNetLoader` / `HSWQLoadConvRotINT8ControlNet`）节点 —— 支持在 ComfyUI 中直接加载 ConvRot / TensorWise INT8 量化 ControlNet（如 Qwen Image Fun ControlNet 等），权重在显存中保持 INT8 并走 `comfy_kitchen` 的 `int8_linear` 执行；通过强制 BF16 模块图构建与显式注入 `int8_tensorwise` MixedPrecisionOps，解决 ComfyUI 原生 `controlnet_load_state_dict` 的 INT8 梯度初始化崩溃问题。
+- 详情见 [发布说明 v3.4.4](v3.4.4.md)。
+
+## Version 3.4.3
+
+- **新增**：**Z Image Hybrid ConvRot NVFP4 — Tensor Core（TC / W4A4）opt-in 路径**。Z Image 的 Linear 热路径现在可以以 **W4A4 TC**（NVFP4 权重 × 4-bit 旋转激活，走原始 `cublas_gemm_blockwise_fp4` GEMM）运行，取代之前的 **Comfy parity W4A16**（NVFP4 权重 × fp16 激活）。由 **轨迹保真度验证** 把关 — 最终 cos ≈ parity（0.951 vs 0.952，0 分叉）— 因此 TC 不会带来系统性质量损失，同时解锁 Tensor Core 加速。
+  - **`input_scale` 校准**：TC 需要每层校准过的 `input_scale`（在旋转域中测得 `amax / 2688`，独立的 `calib_input_scale_nvfp4.py` 步骤 — 非直方图搜索）。把未校准的 checkpoint 强制走 TC 会导致质量崩溃。
+  - **Loader opt-in 优先级**：`HSWQ_ZI_FORCE_PARITY=1` > `HSWQ_ZI_FORCE_TC=1` > 自动检测 `*.input_scale`；`checkpoint_has_input_scale()` / `zi_use_tensorcore()` 控制该路径。
+  - **GEMM 模式明确化**：addmm（`scaled_mm` 命中 vs 反量化回退）与 parity/TC 前向计数器使日志中的激活模式一目了然。
+- 详情见 [发布说明 v3.4.3](v3.4.3.md)。
+
+## Version 3.4.2
+
+- **修复**：**HSWQ Torch Compile** 在日语 Windows 上的崩溃 — `BackendCompilerFailed`（`AssertionError: Mixing fake modes NYI`，backend=`inductor`），发生于 USDU + Lumina2 NVFP4 + HSWQ Torch Compile，修复了两个根本原因：
+  - **`Mixing fake modes NYI`**：NVFP4 FP4 反量化 LUT（`F.embedding`）在 inductor AOT fake tracing 下重新进入分派。`hswq::dequantize_nvfp4` 现在是带有 `register_fake` 元内核的 `torch.library.custom_op`（数值一致）。
+  - **cp932 `UnicodeDecodeError`**：torch inductor 的 `load_template` 通过裸 `open()` 在 Windows ANSI 代码页上读取 `*.py.jinja`。新增幂等的 `win_utf8_patch.py`（从 `prestartup_script.py` 和 `__init__.py` 加载）强制 UTF-8，使 `torch.compile(backend="inductor")` 现在无需 `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8` 即可运行。
+- 详情见 [发布说明 v3.4.2](v3.4.2.md)。
+
+## Version 3.4.1
+
+- **新增 / 发布**：**Z Image / ZIT Hybrid ConvRot NVFP4** 量化方法与已发布模型。混合包将 **Linear NVFP4（Tensor Core `scaled_mm_nvfp4`）** 与 **INT8 protect（Conv2d / 敏感度选择）层** 结合，通过 **HSWQ ConvRot INT8/ConvRot NVFP4 UNet Loader**（`weight_dtype`：`ConvRot NVFP4`）走与 `hswq/benchmark` 一致的 **Comfy parity** 路径（stock GEMM + online act rotate），与 SDXL 的 Tensor Core 产品路径分离。已发布模型：`Hybrid-Sensitivity-Weighted-Quantization-Z-Image-Hybrid-ConvRot-NVFP4`。README 现已列出全部已发布的 HSWQ 包（SDXL ConvRot INT8 / SDXL ConvRot NVFP4 / Z Image ConvRot NVFP4）。
+- 详情见 [发布说明 v3.4.1](v3.4.1.md)。
+
 ## Version 3.4.0
 
 - **新增**：**SDXL ConvRot NVFP4 Blackwell Tensor Boost** — 仅在 `nodes/nvfp4/` 内对 SM >= 100（B200 / GB200、RTX 5090 / SM120）启用 Per-Weight CUDA Graph 自动分发（不影响 Z Image / INT8 / FP8 / 标准路径）。回放时消除 shape-shared 的权重 `.copy_()`；自适应 `M` 上限 16384；捕获 / 命中控制台日志与 `nvfp4_forward_stats()`（`blackwell_graph_hits`、`blackwell_tensor_boost_active`）。**HSWQ Sampler** 与 **HSWQ Ultimate SD Upscale** 上独立的 **`tensor_boost` BOOLEAN**（默认 OFF；Loader 无开关），经 `HSWQ_NVFP4_TENSORBOOST` / `HSWQ_NVFP4_CUDAGRAPH` 控制，OFF 时调用 `clear_nvfp4_cudagraphs()`，避免 USDU 分块时显存暴涨。**开启会使显存增加数 GB**（CUDA Graph arena）——放大 / Tensor Boost 余量推荐 **RTX 5090 32 GB+**；采样器路径 **16 GB+**。文档：`md/HSWQ_SDXL_NVFP4_BLACKWELL_ACCELERATION_GUIDE.md`。
@@ -71,77 +230,77 @@
 
 - **更改**：更新 `pyproject.toml` 的 `[project].name`，使其与新仓库身份一致，ComfyUI 注册表分类显示为 **comfyui-hswq-loader-and-tools**。
 - **更改**：以更正后的项目名称向 ComfyUI 重新注册本节点包。
-- 详情见 [Release Notes v3.2.9](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.9)。
+- 详情见 [Release Notes v3.2.9](v3.2.9.md)。
 
 ## Version 3.2.8
 
 - **更改**：仓库重命名为 **ComfyUI-HSWQ-Loader-and-Tools**。
 - **更改**：节点由 **HSWQ&Nunchaku Ultimate SD Upscale** 重命名为 **HSWQ Ultimate SD Upscale**（包括类名、ID 与标题）。
-- 详情见 [Release Notes v3.2.8](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.8)。
+- 详情见 [Release Notes v3.2.8](v3.2.8.md)。
 
 ## Version 3.2.7
 
 - **移除**：节点内 INT8 W8A8 Triton Linear 加速（Plan B）—— 融合内核、`install.py` 的 Triton 阶段以及 **Triton accelerate** UI 开关。INT8 Linear 速度改由 ComfyUI + `comfy_kitchen`（`int8_linear`：cuda → triton → eager）负责。本扩展仅保留 INT8 加载兼容补丁（Conv2d / LoRA / ControlLora / handoff）。
-- 详情见 [Release Notes v3.2.7](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.7)。
+- 详情见 [Release Notes v3.2.7](v3.2.7.md)。
 
 ## Version 3.2.6
 
 - **新增**：面向 HSWQ INT8 加载器的公开 INT8 W8A8 Triton Linear 加速（Plan B）—— 融合的逐行激活量化 → INT8 GEMM → 反量化，无需依赖 Comfy `--enable-triton-backend`；`install.py` 中内置 Windows/Linux Triton 安装；UI 开关 **Triton accelerate**；分块逐行量化，使宽层（如 K=10240）仍可走融合路径。
-- 详情见 [Release Notes v3.2.6](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.6)。
+- 详情见 [Release Notes v3.2.6](v3.2.6.md)。
 
 ## Version 3.2.5
 
 - **修复**：在过时的便携 / 内嵌 Python 环境下 `requirements.txt` 安装失败 —— 一个无 wheel 的传递性源码依赖（`facexlib` 拉取的 `filterpy`）强制进行源码构建，由于环境自带旧版 `setuptools`，在 Python 3.12+ 上因 `AttributeError: module 'pkgutil' has no attribute 'ImpImporter'` 而崩溃。新增的 `install.py` 会在安装 `requirements.txt` 前升级 `pip` / `setuptools` / `wheel`，使 ComfyUI-Manager 的安装/更新先修复构建工具，旧源码构建得以成功。
-- 详情见 [Release Notes v3.2.5](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.5)。
+- 详情见 [Release Notes v3.2.5](v3.2.5.md)。
 
 ## Version 3.2.4
 
 - **修复**：SDXL LoRA 型 ControlNet（如 `anytest`）在 INT8 量化下输出全黑 —— `ControlLora.pre_run` 通过 `diffusion_model.state_dict()` 借用 INT8 基础 UNet 权重，而该接口返回的是被扁平化的原始 `int8`/`uint8` 张量而非 `QuantizedTensor`，导致借用的权重未被反量化。补丁拦截该 `state_dict()` 并即时对 INT8 基础权重进行反量化（全权重 ControlNet 如 `canny` 不受影响；FP8 下不会出现该问题）。
-- 详情见 [Release Notes v3.2.4](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.4)。
+- 详情见 [Release Notes v3.2.4](v3.2.4.md)。
 
 ## Version 3.2.3
 
 - **新增**：**HSWQ Sampler** —— 与标准 ComfyUI KSampler 行为完全一致的等效节点，但在安装了 [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF) 时会自动加入其全部 samplers 与 schedulers。它复刻了 Forge 的动态 sampler 生成逻辑，使完整的 Runge-Kutta（`rk_beta`）sampler 家族在原生 ComfyUI 中保持可选且可运行。
-- 详情见 [Release Notes v3.2.3](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.3)。
+- 详情见 [Release Notes v3.2.3](v3.2.3.md)。
 
 ## Version 3.2.2
 
 - **修复**：非 SVDQ 加载（包括 SDXL INT8 普通生成）时 INT8→Nunchaku VRAM handoff 误判 —— SVDQ 检测不再使用单纯的 `"nunchaku" in __module__`（本扩展的 INT8 Conv2d 路径包含该子串）；handoff `_VER = 10` 仅在 BaseModel 上存在真正的 Nunchaku SVDQ 时启用，原生 comfy_quant INT8（任意架构）从不启用 handoff。
-- 详情见 [Release Notes v3.2.2](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.2)。
+- 详情见 [Release Notes v3.2.2](v3.2.2.md)。
 
 ## Version 3.2.1
 
 - **修复**：INT8 HSWQ（Dynamic VRAM）→ Nunchaku SVDQ 共存 Abort —— LowVramPatch 与 Dynamic LoRA bake 仅限于 `comfy.quant_ops.QuantizedTensor`（绝不针对裸 `torch.int8`）；在 SVDQ 加载前使用单向 VRAM handoff `detach(unpatch_all=True)`。
 - **移除**：再次重新引入 **HSWQ Pin Buffer Cache**（Abort 修复并不需要；AIMDO HostBuffer 之后 Detailer 作用域的 pin 池化依然过时）。
 - **文档**：重写 `md/HSWQ_INT8_NUNCHAKU_COEXISTENCE_GUIDE.md`，记录经核实的 Abort 原因与 PinCache 相关性。
-- 详情见 [Release Notes v3.2.1](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.1)。
+- 详情见 [Release Notes v3.2.1](v3.2.1.md)。
 
 ## Version 3.2.0
 
 - **移除**：**HSWQ Pin Buffer Cache**（`nodes/hswq_pin_cache.py` 及 Detailer `hswq_pin_cache_scope`）—— 在 ComfyUI Dynamic VRAM / AIMDO `HostBuffer` 更新后已冗余（不存在 `unpin` 路径的抖动）。保留 Batched Detailer 三阶段流程；使用原生 ComfyUI pin 行为。
 - **更改**：SDXL checkpoint 加载器节点的显示标题强制改为 **HSWQ Checkpoint Loader (SDXL)**。
-- 详情见 [Release Notes v3.2.0](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.2.0)。
+- 详情见 [Release Notes v3.2.0](v3.2.0.md)。
 
 ## Version 3.1.9
 
 - **新增**：面向 SDXL 检查点的原生 **comfy_quant INT8**（`int8_tensorwise`）加载路径 —— **HSWQ FP8/INT8 Loader (VRAM Opt)** 自动检测 INT8 与 Scaled FP8；**HSWQ FP8 E4M3 UNet Loader** 增加 `int8_tensorwise` / 自动检测。扩展侧提供 Conv2d 量化支持以及 Dynamic VRAM 下的 INT8 安全 LoRA bake。
-- 详情见 [Release Notes v3.1.9](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.1.9)。
+- 详情见 [Release Notes v3.1.9](v3.1.9.md)。
 
 ## Version 3.1.8
 
 - **新增**：**HSWQ Save Image**（`NunchakuSaveImage`）—— 将 `IMAGE` 输出保存为 PNG 或 JPG（选择 JPG 时可设置 JPEG 质量）。
 - **新增**：**Nunchaku Ultimate SD Upscale** —— `upscale_by` 下拉框带有 **Auto** 模式与 `target_height`（默认 4320），可由输入高度推导放大倍率；固定倍率 0.05–4.00 仍然可用。
-- 详情见 [Release Notes v3.1.8](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.1.8)。
+- 详情见 [Release Notes v3.1.8](v3.1.8.md)。
 
 ## Version 3.1.7
 
 - **修复**：关键性修复 —— 在与 Lumina/HunYuan-DiT 架构配合使用时，`NunchakuUltimateSDUpscale` 出现严重输出噪声与 `RuntimeError`。已修正 conditioning 张量切片逻辑，可从拼接张量中精确提取 T5/LLM 特征。
-- 详情见 [Release Notes v3.1.7](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.1.7)。
+- 详情见 [Release Notes v3.1.7](v3.1.7.md)。
 
 ## Version 3.1.3
 
 - **修复**：针对 `NunchakuUltimateSDUpscale` 中 `RuntimeError` 的临时绕过方案 —— 近期 ComfyUI 核心变更会沿特征维度（例如由 2560 变为 7680）拼接多编码器 conditioning，影响基于 Lumina/HunYuan 的模型。已在采样前加入自动检测与截断。
-- 详情见 [Release Notes v3.1.3](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.1.3)。
+- 详情见 [Release Notes v3.1.3](v3.1.3.md)。
 
 ## Version 3.1.2
 
@@ -150,14 +309,14 @@
 ## Version 3.1.1
 
 - **修复**：Bug 修复与更正（加载器注册、zimage 模型处理、USDU crop 模型补丁）。
-- 详情见 [Release Notes v3.1.1](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.1.1)。
+- 详情见 [Release Notes v3.1.1](v3.1.1.md)。
 
 ## Version 3.1.0
 
 - **新增** 两个节点：
   - **HSWQ FP8 E4M3 UNet Loader**（`HSWQFP8E4M3UNetLoader`）—— 面向 HSWQ FP8 E4M3 模型的标准 UNet 加载器；扩展还安装 Pin Buffer Cache，降低 Dynamic VRAM Loading 下的 `cudaHostRegister`/`cudaHostUnregister` 开销。
   - **HSWQ Batched Detailer (SEGS)** —— Detailer (SEGS) 风格节点，以三阶段运行 VAE 编码 → UNet 采样 → VAE 解码（先全部编码、再全部采样、最后全部解码），最大程度减少模型切换，提升 Dynamic VRAM Loading 下的性能。
-- 详情见 [Release Notes v3.1.0](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/releases/tag/v3.1.0)。
+- 详情见 [Release Notes v3.1.0](v3.1.0.md)。
 
 ## Version 3.0.2
 
@@ -261,3 +420,4 @@
 ## 2025-12-25
 
 - 通过改进带更好路径解析的替代导入方式，修复 `NunchakuZImageDiTLoader` 节点的导入错误（见 [Issue #1](https://github.com/ussoewwin/ComfyUI-HSWQ-Loader-and-Tools/issues/1)）
+
