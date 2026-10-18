@@ -173,10 +173,7 @@ class set_precision_advanced:
         latent_out64 = latent_image["samples"].to(torch.float64)
 
         target_dtype = dtype_map[global_precision]
-        if latent_image["samples"].dtype != target_dtype:
-            latent_image["samples"] = latent_image["samples"].to(target_dtype)
-
-        latent_cast_to_global = latent_image["samples"]
+        latent_cast_to_global = latent_image["samples"].to(target_dtype)
 
         return ({"samples": latent_passthrough},
                 {"samples": latent_cast_to_global},

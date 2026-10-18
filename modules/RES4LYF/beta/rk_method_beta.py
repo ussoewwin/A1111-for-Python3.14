@@ -12,7 +12,7 @@ from .rk_coefficients_beta import get_implicit_sampler_name_list, get_rk_methods
 from ..helper              import ExtraOptions
 from ..latents             import get_orthogonal, get_collinear, get_cosine_similarity, tile_latent, untile_latent
 
-from ..res4lyf             import RESplain
+from ..res4lyf             import RESplain, is_debug_logging_enabled
 
 MAX_STEPS = 10000
 
@@ -87,11 +87,21 @@ class RK_Method_Beta:
 
         self.reorder_tableau_indices     : list[int]                = self.EO("reorder_tableau_indices", [-1])
 
+        # ComfyUI casts the latent to the model's compute dtype before the network runs, so precision
+        # above work_dtype never reaches the model — it only widens ComfyUI's cond/CFG temporaries.
+        self.work_dtype                  : torch.dtype              = self.EO("work_dtype", torch.float32)
+
         self.LINEAR_ANCHOR_X_0           : float                    = noise_anchor
         
         self.tile_sizes                  : Optional[List[Tuple[int,int]]] = None
         self.tile_cnt                    : int                      = 0
         self.latent_compression_ratio    : int                      = 8
+        # track model calls
+        self.model_calls_total    : int = 0
+        self.model_calls_denoised : int = 0
+        self.model_calls_epsilon  : int = 0
+
+        self.latent_guide = None
 
     @staticmethod
     def is_exponential(rk_type:str) -> bool:
@@ -127,20 +137,41 @@ class RK_Method_Beta:
     def __call__(self):
         raise NotImplementedError("This method got clownsharked!")
     
+    def _offload_peripherals(self):
+        if self.latent_guide is not None:
+            self.latent_guide.offload('cpu')
+
+    def _restore_peripherals(self):
+        if self.latent_guide is not None:
+            self.latent_guide.restore()
+
     def model_epsilon(self, x:Tensor, sigma:Tensor, **extra_args) -> Tuple[Tensor, Tensor]:
+        if x.dtype != self.work_dtype:
+            x     = x    .to(self.work_dtype)
+            sigma = sigma.to(self.work_dtype)
         s_in     = x.new_ones([x.shape[0]])
+        self._offload_peripherals()
         denoised = self.model(x, sigma * s_in, **extra_args)
+        self._restore_peripherals()
+        # increment counters (single call path)
+        self.model_calls_total    += 1
+        self.model_calls_epsilon  += 1
         denoised = self.calc_cfg_channelwise(denoised)
-        eps      = (x - denoised) / (sigma * s_in).view(x.shape[0], 1, 1, 1)       #return x0 ###################################THIS WORKS ONLY WITH THE MODEL SAMPLING PATCH
+        eps      = (x - denoised) / (sigma * s_in).view(x.shape[0], *[1]*(x.ndim-1))
         return eps, denoised
     
     def model_denoised(self, x:Tensor, sigma:Tensor, **extra_args) -> Tensor:
+        if x.dtype != self.work_dtype:
+            x     = x    .to(self.work_dtype)
+            sigma = sigma.to(self.work_dtype)
         s_in     = x.new_ones([x.shape[0]])
         control_tiles = None
         y0_style_pos = self.extra_args['model_options']['transformer_options'].get("y0_style_pos")
         y0_style_neg = self.extra_args['model_options']['transformer_options'].get("y0_style_neg")
         y0_style_pos_tile, sy0_style_neg_tiles = None, None
-        
+
+        self._offload_peripherals()
+
         if self.EO("tile_model_calls"):
             tile_h = self.EO("tile_h", 128)
             tile_w = self.EO("tile_w", 128)
@@ -153,7 +184,9 @@ class RK_Method_Beta:
                 tile = tiles[i].unsqueeze(0)
                 
                 denoised_tile = self.model(tile, sigma * s_in, **extra_args)
-                
+                # increment counters per tile
+                self.model_calls_total    += 1
+                self.model_calls_denoised += 1
                 denoised_tiles.append(denoised_tile)
                 
             denoised_tiles = torch.cat(denoised_tiles, dim=0)
@@ -201,7 +234,7 @@ class RK_Method_Beta:
             if positive_control is not None and hasattr(positive_control, 'cond_hint_original'):
                 positive_cond_hint_init = positive_control.cond_hint.clone() if positive_control.cond_hint is not None else None
                 if positive_control.cond_hint_original.shape[-1] != x.shape[-2] * self.latent_compression_ratio or positive_control.cond_hint_original.shape[-2] != x.shape[-1] * self.latent_compression_ratio:
-                    positive_control_pretile = comfy.utils.bislerp(positive_control.cond_hint_original.clone().to(torch.float16).to('cuda'), x.shape[-1] * self.latent_compression_ratio, x.shape[-2] * self.latent_compression_ratio)
+                    positive_control_pretile = comfy.utils.common_upscale(positive_control.cond_hint_original.clone().to(torch.float16).to('cuda'), x.shape[-1] * self.latent_compression_ratio, x.shape[-2] * self.latent_compression_ratio, "bislerp", "disabled")
                     positive_control.cond_hint_original = positive_control_pretile.to(positive_control.cond_hint_original)
                 positive_control_pretile = positive_control.cond_hint_original.clone().to(torch.float16).to('cuda')
                 control_tiles, control_orig_shape, control_grid, control_strides = tile_latent(positive_control_pretile, tile_size=(tile_h_full,tile_w_full))
@@ -230,7 +263,9 @@ class RK_Method_Beta:
                     self.extra_args['model_options']['transformer_options']['y0_style_neg'] = y0_style_neg_tiles[i].unsqueeze(0)
                 
                 denoised_tile = self.model(tile, sigma * s_in, **extra_args)
-                
+                # increment counters per tile
+                self.model_calls_total    += 1
+                self.model_calls_denoised += 1
                 denoised_tiles.append(denoised_tile)
                 
             denoised_tiles = torch.cat(denoised_tiles, dim=0)
@@ -239,7 +274,12 @@ class RK_Method_Beta:
             
         else:
             denoised = self.model(x, sigma * s_in, **extra_args)
-        
+            # increment counters (single call path)
+            self.model_calls_total    += 1
+            self.model_calls_denoised += 1
+
+        self._restore_peripherals()
+
         if control_tiles is not None:
             positive_control.cond_hint = positive_cond_hint_init
             if negative_control is not None:
@@ -259,6 +299,19 @@ class RK_Method_Beta:
 
         self.extra_args.setdefault("model_options", {}).setdefault("transformer_options", {}).update(transformer_options)
         return
+
+    # helper API to reset/read counters
+    def reset_model_call_counters(self) -> None:
+        self.model_calls_total    = 0
+        self.model_calls_denoised = 0
+        self.model_calls_epsilon  = 0
+
+    def get_model_call_counters(self) -> Dict[str, int]:
+        return {
+            "total":    self.model_calls_total,
+            "denoised": self.model_calls_denoised,
+            "epsilon":  self.model_calls_epsilon,
+        }
 
     def set_coeff(self,
                 rk_type    : str,
@@ -384,24 +437,25 @@ class RK_Method_Beta:
             row = row - self.rows
             return self.b_k_einsum2(row, k, h_new, sigma)
 
+    # einsum does not type-promote: the float64 tableau operands must be cast to the buffer dtype
     def a_k_einsum2(self, row:int, k:Tensor, h:Tensor, sigma:Tensor) -> Tensor:
-        return torch.einsum('i,j,k,i... -> ...', self.A[row], h.unsqueeze(0), -sigma.unsqueeze(0), k[:self.cols])
-    
-    def b_k_einsum2(self, row:int, k:Tensor, h:Tensor, sigma:Tensor) -> Tensor:
-        return torch.einsum('i,j,k,i... -> ...', self.B[row], h.unsqueeze(0), -sigma.unsqueeze(0), k[:self.cols])
+        return torch.einsum('i,j,k,i... -> ...', self.A[row].to(k.dtype), h.unsqueeze(0).to(k.dtype), -sigma.unsqueeze(0).to(k.dtype), k[:self.cols])
 
-    
+    def b_k_einsum2(self, row:int, k:Tensor, h:Tensor, sigma:Tensor) -> Tensor:
+        return torch.einsum('i,j,k,i... -> ...', self.B[row].to(k.dtype), h.unsqueeze(0).to(k.dtype), -sigma.unsqueeze(0).to(k.dtype), k[:self.cols])
+
+
     def a_k_einsum(self, row:int, k     :Tensor) -> Tensor:
-        return torch.einsum('i, i... -> ...', self.A[row], k[:self.cols])
-    
+        return torch.einsum('i, i... -> ...', self.A[row].to(k.dtype), k[:self.cols])
+
     def b_k_einsum(self, row:int, k     :Tensor) -> Tensor:
-        return torch.einsum('i, i... -> ...', self.B[row], k[:self.cols])
-    
+        return torch.einsum('i, i... -> ...', self.B[row].to(k.dtype), k[:self.cols])
+
     def u_k_einsum(self, row:int, k_prev:Tensor) -> Tensor:
-        return torch.einsum('i, i... -> ...', self.U[row], k_prev[:self.cols]) if (self.U is not None and k_prev is not None) else 0
-    
+        return torch.einsum('i, i... -> ...', self.U[row].to(k_prev.dtype), k_prev[:self.cols]) if (self.U is not None and k_prev is not None) else 0
+
     def v_k_einsum(self, row:int, k_prev:Tensor) -> Tensor:
-        return torch.einsum('i, i... -> ...', self.V[row], k_prev[:self.cols]) if (self.V is not None and k_prev is not None) else 0
+        return torch.einsum('i, i... -> ...', self.V[row].to(k_prev.dtype), k_prev[:self.cols]) if (self.V is not None and k_prev is not None) else 0
     
     
     
@@ -413,8 +467,8 @@ class RK_Method_Beta:
             return self.b_k_einsum(row, k) + self.v_k_einsum(row, k_prev)
         
     def zum_tableau(self,  k:Tensor, k_prev:Tensor=None,) -> Tensor:
-        a_k_sum = torch.einsum('ij, j... -> i...', self.A, k[:self.cols])
-        u_k_sum = torch.einsum('ij, j... -> i...', self.U, k_prev[:self.cols]) if (self.U is not None and k_prev is not None) else 0
+        a_k_sum = torch.einsum('ij, j... -> i...', self.A.to(k.dtype), k[:self.cols])
+        u_k_sum = torch.einsum('ij, j... -> i...', self.U.to(k.dtype), k_prev[:self.cols]) if (self.U is not None and k_prev is not None) else 0
         return a_k_sum + u_k_sum
         
     def get_x(self, data:Tensor, noise:Tensor, sigma:Tensor):
@@ -539,69 +593,63 @@ class RK_Method_Beta:
                                             data_prev_        : Tensor,
                                             NS,
                                             sigmas            : Tensor,
-                                            step              : Tensor,
-                                            rk_swap_step      : int,
-                                            rk_swap_threshold : float,
-                                            rk_swap_type      : str,
-                                            rk_swap_print     : bool,
-                                            ) -> str:
-        if rk_swap_type == "":
-            if self.EXPONENTIAL:
-                rk_swap_type = "res_3m" 
-            else:
-                rk_swap_type = "deis_3m"
-            
-        if step > rk_swap_step and self.rk_type != rk_swap_type:
-            RESplain("Switching rk_type to:", rk_swap_type)
-            self.rk_type = rk_swap_type
-            
-            if RK_Method_Beta.is_exponential(rk_swap_type):
-                self.__class__ = RK_Method_Exponential
-            else:
-                self.__class__ = RK_Method_Linear
-                
-            if rk_swap_type in get_implicit_sampler_name_list(nameOnly=True):
-                self.IMPLICIT   = True
-                self.row_offset = 0
-                NS.row_offset   = 0
-            else:
-                self.IMPLICIT   = False
-                self.row_offset = 1
-                NS.row_offset   = 1
-            NS.h_fn     = self.h_fn
-            NS.t_fn     = self.t_fn
-            NS.sigma_fn = self.sigma_fn
-            
-            
-            
-        if step > 2 and sigmas[step+1] > 0 and self.rk_type != rk_swap_type and rk_swap_threshold > 0:
-            x_res_2m, denoised_res_2m = self.calculate_res_2m_step(x_0, data_prev_, NS.sigma_down, sigmas, step)
-            x_res_3m, denoised_res_3m = self.calculate_res_3m_step(x_0, data_prev_, NS.sigma_down, sigmas, step)
-            if denoised_res_2m is not None:
-                if rk_swap_print:
-                    RESplain("res_3m - res_2m:", torch.norm(denoised_res_3m - denoised_res_2m).item())
-                if rk_swap_threshold > torch.norm(denoised_res_2m - denoised_res_3m):
-                    RESplain("Switching rk_type to:", rk_swap_type, "at step:", step)
-                    self.rk_type = rk_swap_type
-            
-                    if RK_Method_Beta.is_exponential(rk_swap_type):
-                        self.__class__ = RK_Method_Exponential
-                    else:
-                        self.__class__ = RK_Method_Linear
-                
-                    if rk_swap_type in get_implicit_sampler_name_list(nameOnly=True):
-                        self.IMPLICIT   = True
-                        self.row_offset = 0
-                        NS.row_offset   = 0
-                    else:
-                        self.IMPLICIT   = False
-                        self.row_offset = 1
-                        NS.row_offset   = 1
-                    NS.h_fn     = self.h_fn
-                    NS.t_fn     = self.t_fn
-                    NS.sigma_fn = self.sigma_fn
-            
-        return self.rk_type
+                                            step              : int,
+                                            step_sched        : int,
+                                            rk_swaps          : list,
+                                            ):
+        if not rk_swaps:
+            return self.rk_type, False
+
+        swap_at = {swap['step']: swap for swap in rk_swaps}
+
+        target_swap = swap_at.get(step_sched)
+
+        if target_swap is None:
+            for swap in sorted(rk_swaps, key=lambda s: s['step']):
+                if step_sched < swap['step'] and swap['threshold'] > 0:
+                    threshold = swap['threshold']
+                    if x_0 is not None and step > 2 and sigmas[step+1] > 0 and self.rk_type != swap['type']:
+                        x_res_2m, denoised_res_2m = self.calculate_res_2m_step(x_0, data_prev_, NS.sigma_down, sigmas, step)
+                        x_res_3m, denoised_res_3m = self.calculate_res_3m_step(x_0, data_prev_, NS.sigma_down, sigmas, step)
+                        if denoised_res_2m is not None:
+                            if swap['print']:
+                                RESplain("res_3m - res_2m:", torch.norm(denoised_res_3m - denoised_res_2m).item())
+                            if threshold > torch.norm(denoised_res_2m - denoised_res_3m):
+                                target_swap = swap
+                    break
+
+        if target_swap is None:
+            return self.rk_type, False
+
+        swap_type = target_swap['type']
+        if swap_type == "":
+            swap_type = "res_3m" if self.EXPONENTIAL else "deis_3m"
+
+        if self.rk_type == swap_type:
+            return self.rk_type, False
+
+        RESplain("Switching rk_type to:", swap_type, "at step:", step_sched)
+
+        self.rk_type = swap_type
+
+        if RK_Method_Beta.is_exponential(swap_type):
+            self.__class__ = RK_Method_Exponential
+        else:
+            self.__class__ = RK_Method_Linear
+
+        if swap_type in get_implicit_sampler_name_list(nameOnly=True):
+            self.IMPLICIT   = True
+            self.row_offset = 0
+            NS.row_offset   = 0
+        else:
+            self.IMPLICIT   = False
+            self.row_offset = 1
+            NS.row_offset   = 1
+        NS.h_fn     = self.h_fn
+        NS.t_fn     = self.t_fn
+        NS.sigma_fn = self.sigma_fn
+
+        return self.rk_type, True
 
 
     def bong_iter(self,
@@ -701,9 +749,9 @@ class RK_Method_Beta:
                                     if self.EO("sync_x2y"):
                                         eps_ = sync_mask * eps_x_   +   (1-sync_mask) * eps_x2y_   +   weight_mask * (-eps_x2y_+sigma*(y0_bongflow-noise_sync))
                             else:
-                                eps_x_  [:s_.shape[0]] = (x_[:s_.shape[0]] - data_x_[:s_.shape[0]]) / s_.view(-1,1,1,1,1)   # or should it be vs x_0???
+                                eps_x_  [:s_.shape[0]] = (x_[:s_.shape[0]] - data_x_[:s_.shape[0]]) / s_.view(-1, *[1]*(x_.ndim-1))
                                 eps_x2y_ = torch.zeros_like(eps_x_)
-                                eps_x2y_[:s_.shape[0]] = (x_[:s_.shape[0]] - data_y_[:s_.shape[0]]) / s_.view(-1,1,1,1,1)   # or should it be vs x_0???
+                                eps_x2y_[:s_.shape[0]] = (x_[:s_.shape[0]] - data_y_[:s_.shape[0]]) / s_.view(-1, *[1]*(x_.ndim-1))
 
                                 if self.VE_MODEL:
                                     eps_ = sync_mask * eps_x_   +   (1-sync_mask) * eps_x2y_   +   weight_mask * (noise_sync-eps_y_)
@@ -1057,7 +1105,7 @@ class RK_Method_Linear(RK_Method_Beta):
         if   len(args) == 3:
             x, denoised, sigma = args
             return (x - denoised) / sigma
-        elif len(args == 5):
+        elif len(args) == 5:
             x_0, x, denoised, sigma, sub_sigma = args
             eps_anchor   = (x_0 - denoised) / sigma
             eps_unmoored =   (x - denoised) / sub_sigma

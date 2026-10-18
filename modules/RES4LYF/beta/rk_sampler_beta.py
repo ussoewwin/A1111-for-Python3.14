@@ -12,7 +12,11 @@ import comfy
 
 from ..res4lyf              import RESplain
 from ..helper               import ExtraOptions, FrameWeightsManager
-from ..latents              import lagrange_interpolation, get_collinear, get_orthogonal, get_cosine_similarity, get_pearson_similarity, get_slerp_weight_for_cossim, get_slerp_ratio, slerp_tensor, get_edge_mask, normalize_zscore, compute_slerp_ratio_for_target, find_slerp_ratio_grid
+from ..latents              import lagrange_interpolation, get_collinear, get_orthogonal, get_cosine_similarity, get_pearson_similarity, \
+                                   get_slerp_weight_for_cossim, get_slerp_ratio, slerp_tensor, get_edge_mask, normalize_zscore, \
+                                   compute_slerp_ratio_for_target, find_slerp_ratio_grid, \
+                                   is_packed_latent, get_latent, apply_per_step_latent_normalization, LatentHandler, \
+                                   derive_old_latent_shapes, extract_video_tail, extend_state_info_tensors
 from ..style_transfer       import apply_scattersort_spatial, apply_adain_spatial
 
 from .rk_method_beta        import RK_Method_Beta
@@ -20,6 +24,8 @@ from .rk_noise_sampler_beta import RK_NoiseSampler
 from .rk_guide_func_beta    import LatentGuide
 from .phi_functions         import Phi
 from .constants             import MAX_STEPS, GUIDE_MODE_NAMES_PSEUDOIMPLICIT
+
+_VRAM_CAP_SET = False
 
 def init_implicit_sampling(
         RK             : RK_Method_Beta,
@@ -176,7 +182,7 @@ def sample_rk_beta(
 
         implicit_type                 : str                = "predictor-corrector",
         implicit_type_substeps        : str                = "predictor-corrector",
-        
+
         implicit_steps_diag           : int                =  0,
         implicit_steps_full           : int                =  0,
 
@@ -212,10 +218,7 @@ def sample_rk_beta(
         state_info                    : Optional[dict[str, Any]] = None,
         state_info_out                : Optional[dict[str, Any]] = None,
         
-        rk_swap_type                  : str                = "",
-        rk_swap_step                  : int                = MAX_STEPS,
-        rk_swap_threshold             : float              = 0.0,
-        rk_swap_print                 : bool               = False,
+        rk_swaps                      : list               = [],
         
         steps_to_run                  : int                = -1,
         start_at_step                 : int                = -1,
@@ -226,13 +229,19 @@ def sample_rk_beta(
         sde_mask                      : Optional[Tensor]   = None,
         
         batch_num                     : int                = 0,
-        
+
         extra_options                 : str                = "",
-        
+
+        outer_sigmas_len              : int                = -1,
+
+        latent_shapes                 : Optional[List[tuple]]  = None,
+        latent_normalize_idx_0_steps  : Optional[List[float]]  = None,
+        latent_normalize_idx_1_steps  : Optional[List[float]]  = None,
+
         AttnMask   = None,
         RegContext = None,
         RegParam   = None,
-        
+
         AttnMask_neg   = None,
         RegContext_neg = None,
         RegParam_neg   = None,
@@ -241,9 +250,35 @@ def sample_rk_beta(
     if sampler_mode == "NULL":
         return x
     
+    # Precision contract:
+    #   default_dtype (float64): sigmas, schedules, tableau/phi coefficients, RK scalar math —
+    #       the cancellation-sensitive operations. Also the default for noise_dtype.
+    #   work_dtype (float32): x and all latent-sized buffers, and the model call boundary.
+    #       work_dtype=float64 restores the classic full-float64 behavior.
+    #   noise_dtype: the dtype noise is generated at — decides which noise realization a seed
+    #       produces (torch's RNG stream differs per dtype), independent of the math precision.
     EO             = ExtraOptions(extra_options)
     default_dtype  = EO("default_dtype", torch.float64)
-    
+    work_dtype     = EO("work_dtype",    torch.float32)
+
+    REPORT_VRAM    = EO("report_vram") and torch.cuda.is_available()
+    if REPORT_VRAM:
+        torch.cuda.reset_peak_memory_stats()
+
+    # vram_cap_gb=N caps the CUDA allocator so OOM reproduces deterministically — headroom flags
+    # like --reserve-vram get absorbed by ComfyUI's weight paging instead of failing
+    global _VRAM_CAP_SET
+    vram_cap_gb    = EO("vram_cap_gb", 0.0)
+    if torch.cuda.is_available():
+        if vram_cap_gb > 0:
+            total_vram = torch.cuda.get_device_properties(0).total_memory
+            torch.cuda.set_per_process_memory_fraction(min(1.0, vram_cap_gb * 1024**3 / total_vram))
+            RESplain(f"vram_cap_gb: capping allocator at {vram_cap_gb} GB of {total_vram / 1024**3:.1f} GB", debug=False)
+            _VRAM_CAP_SET = True
+        elif _VRAM_CAP_SET:
+            torch.cuda.set_per_process_memory_fraction(1.0)
+            _VRAM_CAP_SET = False
+
     extra_args     = {} if extra_args     is None else extra_args
     model_device   = model.inner_model.inner_model.device #x.device
     work_device    = 'cpu' if EO("work_device_cpu") else model_device
@@ -256,12 +291,29 @@ def sample_rk_beta(
     RENOISE = False
     if 'raw_x' in state_info and sampler_mode in {"resample", "unsample"}:
         if x.shape == state_info['raw_x'].shape:
-            x = state_info['raw_x'].to(work_device) #clone()
+            x = state_info['raw_x'].to(work_device)
+            RESplain("Continuing from raw latent from previous sampler.", debug=False)
         else:
-            denoised = comfy.utils.bislerp(state_info['denoised'], x.shape[-1], x.shape[-2])
-            x = denoised.to(x)
-            RENOISE = True
-        RESplain("Continuing from raw latent from previous sampler.", debug=False)
+            shapes_new = latent_shapes if latent_shapes is not None else [x.shape]
+            shapes_old = derive_old_latent_shapes(state_info['raw_x'], shapes_new)
+            can_extend_temporally = (
+                shapes_old is not None
+                and shapes_new[0][-2:] == shapes_old[0][-2:]
+                and shapes_new[0][-3] > shapes_old[0][-3]
+            )
+
+            if can_extend_temporally:
+                extra_T = shapes_new[0][-3] - shapes_old[0][-3]
+                video_tail = extract_video_tail(x, shapes_new, extra_T)
+                state_info = extend_state_info_tensors(state_info, shapes_old, video_tail)
+                x = state_info['raw_x'].to(work_device)
+                RESplain(f"Continuing from raw latent with temporal extension (+{extra_T} video frames).", debug=False)
+            else:
+                x = (LatentHandler(x, latent_shapes)
+                     .map_with(state_info['denoised'], lambda x_t, d_t: comfy.utils.common_upscale(d_t, x_t.shape[-1], x_t.shape[-2], "bislerp", "disabled").to(x_t))
+                     .tensor)
+                RENOISE = True
+                RESplain("Continuing from raw latent from previous sampler (spatial rescale).", debug=False)
     
     
     
@@ -289,14 +341,19 @@ def sample_rk_beta(
             
     if sde_mask is not None:
         from .rk_guide_func_beta import prepare_mask
-        sde_mask, _ = prepare_mask(x, sde_mask, LGW_MASK_RESCALE_MIN)
+        sde_mask, _ = prepare_mask(get_latent(x, latent_shapes, 0), sde_mask, LGW_MASK_RESCALE_MIN)
         sde_mask = sde_mask.to(x.device).to(x.dtype)
     
 
 
-    x      = x     .to(dtype=default_dtype, device=work_device)
+    x      = x     .to(dtype=work_dtype,    device=work_device)
     sigmas = sigmas.to(dtype=default_dtype, device=work_device)
-    
+
+    # sync sample_sigmas in model_options to the effective (unpadded) schedule.
+    if 'model_options' in extra_args:
+        transformer_options = extra_args['model_options'].setdefault('transformer_options', {})
+        transformer_options['sample_sigmas'] = sigmas
+
     c1                          = EO("c1"                         , c1)
     c2                          = EO("c2"                         , c2)
     c3                          = EO("c3"                         , c3)
@@ -323,6 +380,7 @@ def sample_rk_beta(
     RK            = RK_Method_Beta.create(model, rk_type, VE_MODEL, noise_anchor, noise_boost_normalize, model_device=model_device, work_device=work_device, dtype=default_dtype, extra_options=extra_options)
     RK.extra_args = RK.init_cfg_channelwise(x, cfg_cw, **extra_args)
     RK.tile_sizes = tile_sizes
+    RK.reset_model_call_counters()
     RK.extra_args['model_options']['transformer_options']['regional_conditioning_weight'] = 0.0
     RK.extra_args['model_options']['transformer_options']['regional_conditioning_floor']  = 0.0
     
@@ -333,7 +391,7 @@ def sample_rk_beta(
     sigmas_orig = sigmas.clone()
     NS               = RK_NoiseSampler(RK, model, device=work_device, dtype=default_dtype, extra_options=extra_options)
     sigmas, UNSAMPLE = NS.prepare_sigmas(sigmas, sigmas_override, d_noise, d_noise_start_step, sampler_mode)
-    if UNSAMPLE and sigmas_orig[0] == 0.0 and sigmas_orig[0] != sigmas[0] and sigmas[1] < sigmas[2]:
+    if UNSAMPLE and sigmas_orig[0] == 0.0 and sigmas_orig[0] != sigmas[0] and len(sigmas_orig) > 2 and sigmas_orig[1] < sigmas_orig[2]:
         sigmas = torch.cat([torch.full_like(sigmas[0], 0.0).unsqueeze(0), sigmas])
         if start_step == 0:
             start_step  = 1
@@ -341,17 +399,14 @@ def sample_rk_beta(
             start_step -= 1
     
     if sampler_mode in {"resample", "unsample"}:
-        state_info_sigma_next = state_info.get('sigma_next', -1)
-        state_info_start_step = (sigmas == state_info_sigma_next).nonzero().flatten()
-        if state_info_start_step.shape[0] > 0:
-            start_step = state_info_start_step.item()
+        start_step = resolve_start_step_from_sigma_next(sigmas, state_info.get('sigma_next', -1), start_step)
             
     start_step = start_at_step if start_at_step >= 0 else start_step
 
     
     SDE_NOISE_EXTERNAL = False
     if sde_noise is not None:
-        if len(sde_noise) > 0 and sigmas[1] > sigmas[2]:
+        if len(sde_noise) > 0 and len(sigmas_orig) > 2 and sigmas_orig[1] > sigmas_orig[2]:
             SDE_NOISE_EXTERNAL = True
             sigma_up_total = torch.zeros_like(sigmas[0])
             for i in range(len(sde_noise)-1):
@@ -367,14 +422,18 @@ def sample_rk_beta(
     
     NS.init_noise_samplers(x, noise_seed, noise_seed_substep, noise_sampler_type, noise_sampler_type_substep, noise_mode_sde, noise_mode_sde_substep, \
                             overshoot_mode, overshoot_mode_substep, noise_boost_step, noise_boost_substep, alpha, alpha_substep, k, k_substep, \
-                            last_rng=last_rng, last_rng_substep=last_rng_substep,)
+                            last_rng=last_rng, last_rng_substep=last_rng_substep, latent_shapes=latent_shapes,)
 
     data_               = None
     eps_                = None
-    eps                 = torch.zeros_like(x, dtype=default_dtype, device=work_device)
-    denoised            = torch.zeros_like(x, dtype=default_dtype, device=work_device)
-    denoised_prev       = torch.zeros_like(x, dtype=default_dtype, device=work_device)
-    denoised_prev2      = torch.zeros_like(x, dtype=default_dtype, device=work_device)
+    eps                 = torch.zeros_like(x, dtype=work_dtype, device=work_device)
+    denoised            = torch.zeros_like(x, dtype=work_dtype, device=work_device)
+    state_denoised      = state_info.get('denoised')
+    if state_denoised is not None and state_denoised.shape == x.shape:
+        denoised_prev   = state_denoised.to(dtype=work_dtype, device=work_device)
+    else:
+        denoised_prev   = torch.zeros_like(x, dtype=work_dtype, device=work_device)
+    denoised_prev2      = torch.zeros_like(x, dtype=work_dtype, device=work_device)
     x_                  = None
     eps_prev_           = None
     denoised_data_prev  = None
@@ -398,12 +457,26 @@ def sample_rk_beta(
     noise_bongflow      = state_info.get('noise_bongflow')
     y0_standard_guide   = state_info.get('y0_standard_guide')
     y0_inv_standard_guide = state_info.get('y0_inv_standard_guide')
-    
+
+    if y0_bongflow          is not None: y0_bongflow          = y0_bongflow.clone()
+    if y0_bongflow_orig     is not None: y0_bongflow_orig     = y0_bongflow_orig.clone()
+    if noise_bongflow       is not None: noise_bongflow       = noise_bongflow.clone()
+    if y0_standard_guide    is not None: y0_standard_guide    = y0_standard_guide.clone()
+    if y0_inv_standard_guide is not None: y0_inv_standard_guide = y0_inv_standard_guide.clone()
+
     data_prev_y_        = state_info.get('data_prev_y_')
     data_prev_x_        = state_info.get('data_prev_x_')
     data_prev_x2y_      = state_info.get('data_prev_x2y_')
+    if data_prev_y_  is not None: data_prev_y_  = data_prev_y_.clone()
+    if data_prev_x_  is not None: data_prev_x_  = data_prev_x_.clone()
+    if data_prev_x2y_ is not None: data_prev_x2y_ = data_prev_x2y_.clone()
 
-    # BEGIN SAMPLING LOOP    
+    # BEGIN SAMPLING LOOP
+    try:
+        RESplain("Starting sampling loop. Model type: ", model.inner_model.model_patcher.model.diffusion_model._get_name(), debug=True)
+    except:
+        RESplain("Starting sampling loop.", debug=True)
+
     num_steps = len(sigmas[start_step:])-2 if sigmas[-1] == 0 else len(sigmas[start_step:])-1
     
     if steps_to_run >= 0:
@@ -416,7 +489,7 @@ def sample_rk_beta(
     
     INIT_SAMPLE_LOOP = True
     step = start_step
-    sigma, sigma_next, data_prev_ = None, None, None
+    sigma, sigma_next, data_prev_, x_0 = None, None, None, None
     
     if (num_steps-1) == len(sigmas)-2 and sigmas[-1] == 0 and sigmas[-2] == NS.sigma_min:
         progress_bar = trange(current_steps+1, disable=disable)
@@ -425,14 +498,15 @@ def sample_rk_beta(
     
 
     # SETUP GUIDES
-    LG = LatentGuide(model, sigmas, UNSAMPLE, VE_MODEL, LGW_MASK_RESCALE_MIN, extra_options, device=work_device, dtype=default_dtype, frame_weights_mgr=frame_weights_mgr)
+    LG = LatentGuide(model, sigmas, UNSAMPLE, VE_MODEL, LGW_MASK_RESCALE_MIN, extra_options, device=work_device, dtype=work_dtype, frame_weights_mgr=frame_weights_mgr, latent_shapes=latent_shapes)
+    RK.latent_guide = LG
 
     guide_inversion_y0     = state_info.get('guide_inversion_y0')
     guide_inversion_y0_inv = state_info.get('guide_inversion_y0_inv')
 
     x = LG.init_guides(x, RK.IMPLICIT, guides, NS.noise_sampler, batch_num, sigmas[step], guide_inversion_y0, guide_inversion_y0_inv)
-    LG.y0     = y0_standard_guide     if y0_standard_guide     is not None else LG.y0
-    LG.y0_inv = y0_inv_standard_guide if y0_inv_standard_guide is not None else LG.y0_inv
+    LG.y0     = y0_standard_guide.clone()     if y0_standard_guide     is not None else LG.y0
+    LG.y0_inv = y0_inv_standard_guide.clone() if y0_inv_standard_guide is not None else LG.y0_inv
     if (LG.mask != 1.0).any()   and  ((LG.y0 == 0).all() or (LG.y0_inv == 0).all()) : #  and   not LG.guide_mode.startswith("flow"):  # (LG.y0.sum() == 0 or LG.y0_inv.sum() == 0):
         SKIP_PSEUDO = True
         RESplain("skipping pseudo...")
@@ -464,13 +538,13 @@ def sample_rk_beta(
     FLOW_RESUMED = False
     if state_info.get('FLOW_STARTED', False) and not state_info.get('FLOW_STOPPED', False):
         FLOW_RESUMED = True
-        y0 = state_info['y0'].to(work_device) 
-        data_cached = state_info['data_cached'].to(work_device) 
-        data_x_prev_ = state_info['data_x_prev_'].to(work_device) 
+        y0 = state_info['y0'].clone().to(work_device)
+        data_cached = state_info['data_cached'].clone().to(work_device)
+        data_x_prev_ = state_info['data_x_prev_'].clone().to(work_device)
 
     if noise_initial is not None:
         x_init = noise_initial.to(x)
-        RK.update_transformer_options({'x_init': x_init._copy() if hasattr(x_init, 'is_nested') and x_init.is_nested else x_init.clone()})
+        RK.update_transformer_options({'x_init': x_init})
 
     #progress_bar = trange(len(sigmas)-1-start_step, disable=disable)
     
@@ -580,11 +654,25 @@ def sample_rk_beta(
     
     while step < num_steps:
         sigma, sigma_next = sigmas[step], sigmas[step+1]
+
+        # Apply per-step latent normalization for NestedTensor latents
+        if latent_shapes is not None and latent_normalize_idx_0_steps is not None:
+            x = apply_per_step_latent_normalization(
+                x, step, latent_shapes,
+                latent_normalize_idx_0_steps or [1.0],
+                latent_normalize_idx_1_steps or [1.0]
+            )
+
         if sigma_next > sigma:
             step_sched = torch.where(torch.flip(sigmas, dims=[0]) == sigma)[0][0].item()
         else:
             step_sched = step
-        
+
+        rk_type, swapped = RK.swap_rk_type_at_step_or_threshold(x_0, data_prev_, NS, sigmas, step, step_sched, rk_swaps)
+        if swapped:
+            implicit_steps_full = 0
+            implicit_steps_diag = 0
+
         SYNC_GUIDE_ACTIVE = LG.guide_mode.startswith("sync") and (LG.lgw[step_sched] != 0 or LG.lgw_inv[step_sched] != 0 or LG.lgw_sync[step_sched] != 0 or LG.lgw_sync_inv[step_sched] != 0)
         
         if StyleMMDiT is not None:
@@ -636,7 +724,7 @@ def sample_rk_beta(
                 RK.update_transformer_options({'y0_style_pos':        LG.y0_style_pos.clone()})
                 RK.update_transformer_options({'y0_style_pos_weight': LG.lgw_style_pos[step_sched]})
                 RK.update_transformer_options({'y0_style_pos_synweight': guides['synweight_style_pos']})
-                RK.update_transformer_options({'y0_style_pos_mask': LG.mask_style_pos})
+                RK.update_transformer_options({'y0_style_pos_mask': LG.mask_style_pos.clone() if LG.mask_style_pos is not None else None})
                 RK.update_transformer_options({'y0_style_pos_mask_edge': guides.get('mask_edge_style_pos')})
                 RK.update_transformer_options({'y0_style_method': guides['style_method']})
                 RK.update_transformer_options({'y0_style_tile_height': guides.get('style_tile_height')})
@@ -665,7 +753,7 @@ def sample_rk_beta(
                 RK.update_transformer_options({'y0_style_neg':        LG.y0_style_neg.clone()})
                 RK.update_transformer_options({'y0_style_neg_weight': LG.lgw_style_neg[step_sched]})
                 RK.update_transformer_options({'y0_style_neg_synweight': guides['synweight_style_neg']})
-                RK.update_transformer_options({'y0_style_neg_mask': LG.mask_style_neg})
+                RK.update_transformer_options({'y0_style_neg_mask': LG.mask_style_neg.clone() if LG.mask_style_neg is not None else None})
                 RK.update_transformer_options({'y0_style_neg_mask_edge': guides.get('mask_edge_style_neg')})
                 RK.update_transformer_options({'y0_style_method': guides['style_method']})
                 RK.update_transformer_options({'y0_style_tile_height': guides.get('style_tile_height')})
@@ -720,43 +808,48 @@ def sample_rk_beta(
                 lying_s_ = NS.s_.clone()
         
 
-        rk_swap_stages = 3 if rk_swap_type != "" else 0
+        rk_swap_stages = 3 if rk_swaps else 0
         data_prev_len = len(data_prev_)-1 if data_prev_ is not None else 3
         recycled_stages = max(rk_swap_stages, RK.multistep_stages, RK.hybrid_stages, data_prev_len)
         
         if INIT_SAMPLE_LOOP:
             INIT_SAMPLE_LOOP = False
-            x_, data_, eps_, eps_prev_ = (torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device) for _ in range(4))
+            x_, data_, eps_, eps_prev_ = (torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device) for _ in range(4))
             if LG.ADAIN_NOISE_MODE == "smart":
-                z_ = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
+                z_ = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
                 z_[0] = noise_initial.clone()
                 RK.update_transformer_options({'z_' : z_})
             
             if sampler_mode in {"unsample", "resample"}:
                 data_prev_ = state_info.get('data_prev_')
                 if data_prev_ is not None:
-                    if x.shape == state_info['raw_x'].shape:
-                        data_prev_ = state_info['data_prev_'].clone().to(dtype=default_dtype, device=work_device)
+                    if x.shape == data_prev_.shape[1:]:
+                        data_prev_ = state_info['data_prev_'].clone().to(dtype=work_dtype, device=work_device)
                     else:
-                        data_prev_ = torch.stack([comfy.utils.bislerp(data_prev_item, x.shape[-1], x.shape[-2]) for data_prev_item in state_info['data_prev_']])
-                        data_prev_ = data_prev_.to(x)
+                        resized_items = [
+                            LatentHandler(prev_item, latent_shapes)
+                            .map_with(x, lambda p_t, x_t: comfy.utils.common_upscale(p_t, x_t.shape[-1], x_t.shape[-2], "bislerp", "disabled").to(x_t))
+                            .tensor
+                            for prev_item in state_info['data_prev_']
+                        ]
+                        data_prev_ = torch.stack(resized_items).to(x)
                 else:
-                    data_prev_ =  torch.zeros(4, *x.shape, dtype=default_dtype, device=work_device) # multistep max is 4m... so 4 needed
+                    data_prev_ =  torch.zeros(4, *x.shape, dtype=work_dtype, device=work_device) # multistep max is 4m... so 4 needed
             else:
-                data_prev_ =  torch.zeros(4, *x.shape, dtype=default_dtype, device=work_device) # multistep max is 4m... so 4 needed
+                data_prev_ =  torch.zeros(4, *x.shape, dtype=work_dtype, device=work_device) # multistep max is 4m... so 4 needed
             
             recycled_stages = len(data_prev_)-1
         
         if RK.rows+2 > x_.shape[0]:
             row_gap = RK.rows+2 - x_.shape[0]
-            x_gap_, data_gap_, eps_gap_, eps_prev_gap_ = (torch.zeros(row_gap, *x.shape, dtype=default_dtype, device=work_device) for _ in range(4))
+            x_gap_, data_gap_, eps_gap_, eps_prev_gap_ = (torch.zeros(row_gap, *x.shape, dtype=work_dtype, device=work_device) for _ in range(4))
             x_        = torch.cat((x_       ,x_gap_)       , dim=0)
             data_     = torch.cat((data_    ,data_gap_)    , dim=0)
             eps_      = torch.cat((eps_     ,eps_gap_)     , dim=0)
             eps_prev_ = torch.cat((eps_prev_,eps_prev_gap_), dim=0)
             
             if LG.ADAIN_NOISE_MODE == "smart":
-                z_gap_ = torch.zeros(row_gap, *x.shape, dtype=default_dtype, device=work_device)
+                z_gap_ = torch.zeros(row_gap, *x.shape, dtype=work_dtype, device=work_device)
                 z_    = torch.cat((z_       ,z_gap_)       , dim=0)
                 RK.update_transformer_options({'z_' : z_})
 
@@ -983,10 +1076,10 @@ def sample_rk_beta(
 
 
 
-                            if RK.IMPLICIT: 
+                            if RK.IMPLICIT:
                                 if not EO("disable_implicit_guide_preproc"):
-                                    eps_, x_      = LG.process_guides_substep(x_0, x_, eps_,      data_, row, step_sched, sigma, sigma_next, NS.sigma_down, NS.s_, epsilon_scale, RK)
-                                    eps_prev_, x_ = LG.process_guides_substep(x_0, x_, eps_prev_, data_, row, step_sched, sigma, sigma_next, NS.sigma_down, NS.s_, epsilon_scale, RK)
+                                    eps_, x_      = LG.process_guides_substep(x_0, x_, eps_,      data_, denoised_prev, row, step, step_sched, sigma, sigma_next, NS.sigma_down, NS.s_, epsilon_scale, RK, full_iter)
+                                    eps_prev_, x_ = LG.process_guides_substep(x_0, x_, eps_prev_, data_, denoised_prev, row, step, step_sched, sigma, sigma_next, NS.sigma_down, NS.s_, epsilon_scale, RK, full_iter)
                                 if row == 0 and (EO("implicit_lagrange_init")  or   EO("radaucycle")):
                                     pass
                                 else:
@@ -1118,21 +1211,21 @@ def sample_rk_beta(
                                 lure_y_mask  = lgw_mask_lure_y_  + lgw_mask_lure_y_inv_
                                 
                                 if eps_x_ is None:
-                                    eps_x_       = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
-                                    data_x_      = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
-                                    eps_y2x_     = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
-                                    eps_x2y_     = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
-                                    eps_yt_      = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
-                                    eps_y_       = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
-                                    eps_prev_y_  = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
-                                    data_y_      = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
-                                    yt_          = torch.zeros(RK.rows+2, *x.shape, dtype=default_dtype, device=work_device)
+                                    eps_x_       = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
+                                    data_x_      = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
+                                    eps_y2x_     = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
+                                    eps_x2y_     = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
+                                    eps_yt_      = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
+                                    eps_y_       = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
+                                    eps_prev_y_  = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
+                                    data_y_      = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
+                                    yt_          = torch.zeros(RK.rows+2, *x.shape, dtype=work_dtype, device=work_device)
                                     
                                     RUN_X_0_COPY = False
                                     if noise_bongflow is None:
                                         RUN_X_0_COPY = True
-                                        data_prev_x_ = torch.zeros(4, *x.shape, dtype=default_dtype, device=work_device)
-                                        data_prev_y_ = torch.zeros(4, *x.shape, dtype=default_dtype, device=work_device)
+                                        data_prev_x_ = torch.zeros(4, *x.shape, dtype=work_dtype, device=work_device)
+                                        data_prev_y_ = torch.zeros(4, *x.shape, dtype=work_dtype, device=work_device)
                                         
                                         noise_bongflow = normalize_zscore(NS.noise_sampler(sigma=sigma, sigma_next=NS.sigma_min), channelwise=True, inplace=True)
 
@@ -1733,23 +1826,25 @@ def sample_rk_beta(
                                 
                                 lying_eps_row_factor = (1 - noise_scaling_weight*(substep_noise_scaling_ratio-1))
 
-                        # GUIDE 
+                        # GUIDE
                         if not EO("disable_guides_eps_substep"):
-                            eps_, x_      = LG.process_guides_substep(x_0, x_, eps_,      data_, row, step_sched, NS.sigma, NS.sigma_next, NS.sigma_down, NS.s_, epsilon_scale, RK)
+                            eps_, x_      = LG.process_guides_substep(x_0, x_, eps_,      data_, denoised_prev, row, step, step_sched, NS.sigma, NS.sigma_next, NS.sigma_down, NS.s_, epsilon_scale, RK, full_iter)
                         if not EO("disable_guides_eps_prev_substep"):
-                            eps_prev_, x_ = LG.process_guides_substep(x_0, x_, eps_prev_, data_, row, step_sched, NS.sigma, NS.sigma_next, NS.sigma_down, NS.s_, epsilon_scale, RK)
+                            eps_prev_, x_ = LG.process_guides_substep(x_0, x_, eps_prev_, data_, denoised_prev, row, step, step_sched, NS.sigma, NS.sigma_next, NS.sigma_down, NS.s_, epsilon_scale, RK, full_iter)
                         
                         if LG.y0_mean is not None and LG.y0_mean.sum() != 0.0:
+                            if x.ndim == 3:  # packed NestedTensor
+                                raise NotImplementedError("y0_mean guide requires spatial structure, incompatible with packed latents")
 
                             if EO("guide_mean_scattersort"):
                                 data_row_mean = apply_scattersort_spatial(data_[row], LG.y0_mean)
                                 eps_row_mean  = RK.get_eps(x_0, data_row_mean, s_tmp)
                             else:
                                 eps_row_mean = eps_[row] - eps_[row].mean(dim=(-2,-1), keepdim=True) + (LG.y0_mean - x_0).mean(dim=(-2,-1), keepdim=True)
-                            
+
                             if LG.mask_mean is not None:
                                 eps_row_mean = LG.mask_mean * eps_row_mean + (1-LG.mask_mean) * eps_[row]
-                            
+
                             eps_[row] = eps_[row] + LG.lgw_mean[step_sched] * (eps_row_mean - eps_[row])
                             
                         if (full_iter == 0 and diag_iter == 0)   or   EO("newton_iter_post_use_on_implicit_steps"):
@@ -1770,8 +1865,6 @@ def sample_rk_beta(
                         yt_[row+RK.row_offset] = NS.rebound_overshoot_substep(yt_0, yt_[row+RK.row_offset])
                     
                     if not RK.IMPLICIT and NS.noise_mode_sde_substep != "hard_sq":
-
-                        x_means_per_substep = x_[row+RK.row_offset].mean(dim=(-2,-1), keepdim=True)
 
                         if not LG.guide_mode.startswith("flow") or (LG.lgw[step_sched] == 0 and LG.lgw[step+1] == 0   and   LG.lgw_inv[step_sched] == 0 and LG.lgw_inv[step+1] == 0):
                             #if LG.guide_mode.startswith("sync") and (LG.lgw[step_sched] != 0.0 or LG.lgw_inv[step_sched] != 0.0):
@@ -1801,7 +1894,7 @@ def sample_rk_beta(
                                 x_init_new = (x_row_tmp - x_[row+RK.row_offset]) / s_tmp + x_init
                                 x_0 += sigma * (x_init_new - x_init)
                                 x_init = x_init_new
-                                RK.update_transformer_options({'x_init' : x_init.clone()})
+                                RK.update_transformer_options({'x_init': x_init})
                             
                             if SYNC_GUIDE_ACTIVE:
                                 noise_bongflow_new = (x_row_tmp - x_[row+RK.row_offset]) / s_tmp + noise_bongflow
@@ -1922,8 +2015,6 @@ def sample_rk_beta(
             
             x_0_prev = x_0.clone()
 
-            x_means_per_step = x_next.mean(dim=(-2,-1), keepdim=True)
-
             if eta == 0.0:
                 x = x_next
                 if SYNC_GUIDE_ACTIVE:
@@ -1963,7 +2054,7 @@ def sample_rk_beta(
                     x_init_new = (x - x_next) / sigma_next + x_init
                     x_0 += sigma * (x_init_new - x_init)
                     x_init = x_init_new
-                    RK.update_transformer_options({'x_init' : x_init.clone()})
+                    RK.update_transformer_options({'x_init': x_init})
                 
                 if SYNC_GUIDE_ACTIVE:
                     noise_bongflow_new = (x - x_next) / sigma_next + noise_bongflow
@@ -1979,11 +2070,14 @@ def sample_rk_beta(
                 x = x_next
             
             if EO("keep_step_means"):
+                if x.ndim == 3:  # packed NestedTensor
+                    raise NotImplementedError("keep_step_means requires spatial structure, incompatible with packed latents")
                 x = x - x.mean(dim=(-2,-1), keepdim=True) + x_means_per_step
 
             
-            callback_step = len(sigmas)-1 - step if sampler_mode == "unsample" else step
-            preview_callback(x, eps, denoised, x_, eps_, data_, callback_step, sigma, sigma_next, callback, EO, preview_override=data_cached, FLOW_STOPPED=FLOW_STOPPED)
+            callback_step = display_callback_step(step, sampler_mode, len(sigmas), outer_sigmas_len)
+            self_refine_mask = getattr(LG, '_debug_certainty_mask', None)
+            preview_callback(x, eps, denoised, x_, eps_, data_, callback_step, sigma, sigma_next, callback, EO, preview_override=data_cached, FLOW_STOPPED=FLOW_STOPPED, device=model_device, self_refine_mask=self_refine_mask, step_sched=step)
             
             h_prev = NS.h
             x_prev = x_0
@@ -1992,8 +2086,13 @@ def sample_rk_beta(
             denoised_prev  = denoised
             
             full_iter += 1
-            
+
+            if getattr(LG, '_self_refine_converged', False):
+                break
+
             if LG.lgw[step_sched] > 0 and step >= EO("guide_cutoff_start_step", 0) and cossim_counter < EO("guide_cutoff_max_iter", 10) and (EO("guide_cutoff") or EO("guide_min")):
+                if x.ndim == 3:  # packed NestedTensor
+                    raise NotImplementedError("guide_cutoff/guide_min requires spatial structure, incompatible with packed latents")
                 guide_cutoff = EO("guide_cutoff", 1.0)
                 denoised_norm = data_[0] - data_[0].mean(dim=(-2,-1), keepdim=True)
                 y0_norm       = LG.y0    - LG.y0   .mean(dim=(-2,-1), keepdim=True)
@@ -2037,21 +2136,16 @@ def sample_rk_beta(
             for ms in range(recycled_stages):
                 data_prev_y_[recycled_stages - ms] = data_prev_y_[recycled_stages - ms - 1] 
         
-        rk_type = RK.swap_rk_type_at_step_or_threshold(x_0, data_prev_, NS, sigmas, step, rk_swap_step, rk_swap_threshold, rk_swap_type, rk_swap_print)
-        if step > rk_swap_step:
-            implicit_steps_full = 0
-            implicit_steps_diag = 0
-
         if EO("bong2m") or EO("bong3m"):
             denoised_data_prev2 = denoised_data_prev
             denoised_data_prev = data_[0]
         
         if SKIP_PSEUDO and not LG.guide_mode.startswith("flow"):
             if SKIP_PSEUDO_Y == "y0":
-                LG.y0 = denoised
+                LG.y0 = denoised.clone()
                 LG.HAS_LATENT_GUIDE = True
             else:
-                LG.y0_inv = denoised
+                LG.y0_inv = denoised.clone()
                 LG.HAS_LATENT_GUIDE_INV = True
                 
         if EO("pseudo_mix_strength"):
@@ -2080,6 +2174,8 @@ def sample_rk_beta(
                 sigmas = sigmas / NS.sigma_max
         
         if LG.lgw[step_sched] > 0 and step >= EO("guide_step_cutoff_start_step", 0) and cossim_counter < EO("guide_step_cutoff_max_iter", 10) and (EO("guide_step_cutoff") or EO("guide_step_min")):
+            if x.ndim == 3:  # packed NestedTensor
+                raise NotImplementedError("guide_step_cutoff/guide_step_min requires spatial structure, incompatible with packed latents")
             guide_cutoff = EO("guide_step_cutoff", 1.0)
             eps_trash, data_trash = RK(x, sigma_next, x_0, sigma)
             denoised_norm = data_trash - data_trash.mean(dim=(-2,-1), keepdim=True)
@@ -2104,14 +2200,13 @@ def sample_rk_beta(
     #progress_bar.close()
     RK.update_transformer_options({'update_cross_attn':  None})
     if step == len(sigmas)-2 and sigmas[-1] == 0 and sigmas[-2] == NS.sigma_min and not INIT_SAMPLE_LOOP:
-        if EO("skip_final_model_call"):
+        if EO("enable_final_model_call"):
+            eps, denoised = RK(x, NS.sigma_min, x, NS.sigma_min)
+            x = denoised
+        else:
             sigma_min = NS.sigma_min.view((1,) * x.ndim).to(x)
             denoised  = model.inner_model.inner_model.model_sampling.calculate_denoised(sigma_min, eps, x)
             x = denoised
-        else:
-            eps, denoised = RK(x, NS.sigma_min, x, NS.sigma_min)
-            x = denoised
-            #progress_bar.update(1)
 
     eps      = eps     .to(model_device)
     denoised = denoised.to(model_device)
@@ -2119,12 +2214,22 @@ def sample_rk_beta(
     
     progress_bar.close()
 
-    if not (UNSAMPLE and sigmas[1] > sigmas[0]) and not EO("preview_last_step_always") and sigma is not None   and   not (FLOW_STARTED and not FLOW_STOPPED):
-        callback_step = len(sigmas)-1 - step if sampler_mode == "unsample" else step
-        preview_callback(x, eps, denoised, x_, eps_, data_, callback_step, sigma, sigma_next, callback, EO, preview_override=data_cached, FLOW_STOPPED=FLOW_STOPPED)
+    state_info_out['model_call_counts'] = RK.get_model_call_counters()
+    RESplain("Model calls (total/denoised/epsilon):", state_info_out['model_call_counts'], debug=True)
+
+    # re-report only at the schedule end, where it carries the progress bar to 100%;
+    # on partial runs it would just duplicate the loop's last report one step later
+    schedule_end_step = len(sigmas) - 2 if sigmas[-1] == 0 else len(sigmas) - 1
+    if step >= schedule_end_step and not (UNSAMPLE and sigmas[1] > sigmas[0]) and not EO("preview_last_step_always") and sigma is not None   and   not (FLOW_STARTED and not FLOW_STOPPED):
+        callback_step = display_callback_step(step, sampler_mode, len(sigmas), outer_sigmas_len)
+        self_refine_mask = getattr(LG, '_debug_certainty_mask', None)
+        preview_callback(x, eps, denoised, x_, eps_, data_, callback_step, sigma, sigma_next, callback, EO, device=model_device, self_refine_mask=self_refine_mask, step_sched=step, final=True)
+        
+    # judged on the schedule the loop ran on — the same axis as step/end_step
+    RUN_COMPLETED = step == len(sigmas)-2 and sigmas[-1] == 0 and sigmas[-2] == NS.sigma_min
 
     if INIT_SAMPLE_LOOP:
-        state_info_out = state_info
+        state_info_out.update(state_info)
     else:
         if guides is not None and guides.get('guide_mode', "") == 'inversion':
             guide_inversion_y0     = state_info.get('guide_inversion_y0')
@@ -2154,16 +2259,16 @@ def sample_rk_beta(
         state_info_out['sampler_mode']      = sampler_mode
         state_info_out['last_rng']          = NS.noise_sampler .generator.get_state().clone()
         state_info_out['last_rng_substep']  = NS.noise_sampler2.generator.get_state().clone()
-        state_info_out['completed']         = step == len(sigmas)-2 and sigmas[-1] == 0 and sigmas[-2] == NS.sigma_min
+        state_info_out['completed']         = RUN_COMPLETED
         state_info_out['FLOW_STARTED']      = FLOW_STARTED
         state_info_out['FLOW_STOPPED']      = FLOW_STOPPED
-        state_info_out['noise_bongflow']    = noise_bongflow
-        state_info_out['y0_bongflow']       = y0_bongflow
-        state_info_out['y0_bongflow_orig']  = y0_bongflow_orig
-        state_info_out['y0_standard_guide']       = y0_standard_guide
-        state_info_out['y0_inv_standard_guide']  = y0_inv_standard_guide
-        state_info_out['data_prev_y_']      = data_prev_y_
-        state_info_out['data_prev_x_']      = data_prev_x_
+        state_info_out['noise_bongflow']         = noise_bongflow.clone().cpu()      if noise_bongflow       is not None else None
+        state_info_out['y0_bongflow']            = y0_bongflow.clone().cpu()        if y0_bongflow          is not None else None
+        state_info_out['y0_bongflow_orig']       = y0_bongflow_orig.clone().cpu()   if y0_bongflow_orig     is not None else None
+        state_info_out['y0_standard_guide']      = y0_standard_guide.clone().cpu()  if y0_standard_guide    is not None else None
+        state_info_out['y0_inv_standard_guide']  = y0_inv_standard_guide.clone().cpu() if y0_inv_standard_guide is not None else None
+        state_info_out['data_prev_y_']           = data_prev_y_.clone().cpu()       if data_prev_y_         is not None else None
+        state_info_out['data_prev_x_']           = data_prev_x_.clone().cpu()       if data_prev_x_         is not None else None
 
         if noise_initial is not None:
             state_info_out['noise_initial'] = noise_initial.to('cpu')
@@ -2171,10 +2276,14 @@ def sample_rk_beta(
             state_info_out['image_initial'] = image_initial.to('cpu')
 
         if FLOW_STARTED and not FLOW_STOPPED:
-            state_info_out['y0']           = y0.to('cpu') 
+            state_info_out['y0']           = y0.to('cpu')
             #state_info_out['y0_inv']       = y0_inv.to('cpu')       # TODO: implement this?
             state_info_out['data_cached']  = data_cached.to('cpu')
             state_info_out['data_x_prev_'] = data_x_prev_.to('cpu')
+
+    if REPORT_VRAM:
+        RESplain(f"report_vram: peak allocated {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB, "
+                 f"peak reserved {torch.cuda.max_memory_reserved() / 1024**3:.2f} GB (torch allocator only; model weights under dynamic VRAM are not included)", debug=False)
 
     return x
 
@@ -2194,6 +2303,31 @@ def noise_fn(x, sigma, sigma_next, noise_sampler, cossim_iter=1):
     return noise
 
 
+def resolve_start_step_from_sigma_next(sigmas: Tensor, sigma_next, fallback: int) -> int:
+    """Resume index from matching the stored sigma_next on the schedule. Schedules can hold
+    duplicate sigmas (restarts): on multiple matches, take the closest to the fallback."""
+    if isinstance(sigma_next, torch.Tensor):
+        matches = torch.isclose(sigmas, sigma_next.to(sigmas), rtol=1e-5, atol=1e-8).nonzero().flatten()
+    else:
+        matches = (sigmas == sigma_next).nonzero().flatten()
+    if matches.shape[0] == 0:
+        return fallback
+    if matches.shape[0] == 1:
+        return int(matches.item())
+    return int(min(matches.tolist(), key=lambda idx: abs(idx - fallback)))
+
+
+def display_callback_step(step: int, sampler_mode: str, sigmas_len: int, outer_sigmas_len: int) -> int:
+    """Map a loop step onto the axis the progress bar was sized on: unsample counts
+    backwards, resample stretches onto the longer padded outer axis (lossy rounding),
+    standard passes through. Display only — 'i_sched' carries the true index."""
+    if sampler_mode == "unsample":
+        return sigmas_len - 1 - step
+    if sampler_mode == "resample" and outer_sigmas_len > sigmas_len:
+        return int(round(step / (sigmas_len - 1) * (outer_sigmas_len - 1)))
+    return step
+
+
 def preview_callback(
                     x          : Tensor,
                     eps        : Tensor,
@@ -2207,36 +2341,67 @@ def preview_callback(
                     callback   : Callable,
                     EO         : ExtraOptions,
                     preview_override : Optional[Tensor] = None,
-                    FLOW_STOPPED : bool = False):
+                    FLOW_STOPPED : bool = False,
+                    device     : Optional[torch.device] = None,
+                    self_refine_mask : Optional[Tensor] = None,
+                    step_sched : Optional[int] = None,
+                    final      : bool = False,):
 
     if EO("eps_substep_preview"):
         row_callback = EO("eps_substep_preview", 0)
         denoised_callback = eps_[row_callback]
-        
+
     elif EO("denoised_substep_preview"):
         row_callback = EO("denoised_substep_preview", 0)
         denoised_callback = data_[row_callback]
-        
+
     elif EO("x_substep_preview"):
         row_callback = EO("x_substep_preview", 0)
         denoised_callback = x_[row_callback]
-        
+
     elif EO("eps_preview"):
         denoised_callback = eps
-        
+
     elif EO("denoised_preview"):
         denoised_callback = denoised
-        
+
     elif EO("x_preview"):
         denoised_callback = x
-        
+
     elif preview_override is not None and FLOW_STOPPED == False:
         denoised_callback = preview_override
-        
+
     else:
         denoised_callback = data_[0]
-        
-    callback({'x': x, 'i': step, 'sigma': sigma, 'sigma_next': sigma_next, 'denoised': denoised_callback.to(torch.float32)}) if callback is not None else None
-    
+
+    # Overlay self-refine certainty mask on preview
+    if EO("self_refine_mask_preview") and self_refine_mask is not None:
+        mask_mode = EO("self_refine_mask_preview_mode", "zero")
+        denoised_callback = denoised_callback.clone()
+
+        # Expand mask to match data channels if needed
+        if self_refine_mask.shape != denoised_callback.shape:
+            if self_refine_mask.shape[1] == 1 and denoised_callback.shape[1] > 1:
+                mask_expanded = self_refine_mask.expand_as(denoised_callback)
+            else:
+                mask_expanded = self_refine_mask
+        else:
+            mask_expanded = self_refine_mask
+
+        if mask_mode == "invert":
+            denoised_callback = denoised_callback * (1 - 2 * mask_expanded)
+
+        elif mask_mode == "zero":
+            denoised_callback = denoised_callback * (1 - mask_expanded)
+
+
+    if device is not None:
+        denoised_callback = denoised_callback.to(device)
+
+    # 'i' drives comfy's progress bar; 'i_sched' is the true schedule index (state_info axis);
+    # 'final' marks the post-loop re-report
+    if callback is not None:
+        callback({'x': x, 'i': step, 'i_sched': step if step_sched is None else step_sched, 'final': final, 'sigma': sigma, 'sigma_next': sigma_next, 'denoised': denoised_callback.to(torch.float32)})
+
     return
 
