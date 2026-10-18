@@ -1,6 +1,15 @@
-# Release Notes (v1.01 to v3.0.4)
+# Release Notes (v1.01 to v3.0.5)
 
-This document contains release notes for versions v1.01 through v3.0.4. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.0.5. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+
+---
+
+## v3.0.5
+
+### Added: transformers 5.6+ Compatibility for the Flattened CLIPTextModel (SDXL CLIP Key Normalization)
+
+- **Summary**: Added the transformers 5.6+ compatibility layer (`modules/transformers_compat.py` lazy import-hook shims for `HybridCache`/`no_init_weights`, eager submodule resolution in `sd_disable_initialization.py`, `transformers>=5.6.2` pin) and flattened-layout CLIP checkpoint-key normalization at model load in `sd_models.py`, fixing silently dropped SDXL CLIP weights that corrupted output; SDXL/SD1.5 verified generating normal images on transformers 5.20.1.
+- **Release Note**: [v3.0.5 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.5)
 
 ---
 

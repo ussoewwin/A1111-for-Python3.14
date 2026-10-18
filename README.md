@@ -94,7 +94,7 @@ The following packages are installed automatically during initial setup (see `mo
   - Windows: `flash_attn` `2.8.4+cu132torch2.13.0` cp314 prebuilt wheel (HF)
   - Linux: `flash-attn==2.8.4` (PyPI source build against `torch==2.13.0+cu132`; CUDA toolkit 13.2 + `nvcc`; `--no-build-isolation`)
   - macOS: skipped
-- **transformers**: 5.4.0
+- **transformers**: >=5.6.2 (flattened CLIPTextModel compatibility; verified on 5.20.1)
 - **protobuf**: 7.34.1
 - **scipy**: 1.16.1 (PyPI, all platforms)
 - **numpy**: 2.4.6 (PyPI, all platforms; numba / facexlib compatible)
