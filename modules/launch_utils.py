@@ -856,6 +856,11 @@ def configure_for_tests():
 
 def start():
     print(f"Launching {'API server' if '--nowebui' in sys.argv else 'Web UI'} with arguments: {shlex.join(sys.argv[1:])}")
+    # Install import hook so first "import transformers" gets 5.6+ shims applied
+    # (HybridCache alias for peft, no_init_weights shim). Hook never imports
+    # transformers at install time. Ported from Forge-Nunchaku.
+    from modules import transformers_compat
+    transformers_compat.apply()
     import webui
     if '--nowebui' in sys.argv:
         webui.api_only()

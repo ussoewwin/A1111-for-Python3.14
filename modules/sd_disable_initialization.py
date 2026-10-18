@@ -1,7 +1,15 @@
+import importlib as _ilib
+
 import ldm.modules.encoders.modules
 import open_clip
 import torch
 import transformers.utils.hub
+
+# transformers 5.6+: resolve submodules eagerly (attribute lookup on the _LazyModule wrapper is unreliable during model load)
+_transformers = _ilib.import_module('transformers')
+_transformers_modeling_utils = _ilib.import_module('transformers.modeling_utils')
+_transformers_configuration_utils = _ilib.import_module('transformers.configuration_utils')
+_transformers_tokenization_utils_base = _ilib.import_module('transformers.tokenization_utils_base')
 
 from modules import shared
 
@@ -132,9 +140,9 @@ class DisableInitialization(ReplaceHelper):
         if self.disable_clip:
             self.create_model_and_transforms = self.replace(open_clip, 'create_model_and_transforms', create_model_and_transforms_without_pretrained)
             self.CLIPTextModel_from_pretrained = self.replace(ldm.modules.encoders.modules.CLIPTextModel, 'from_pretrained', CLIPTextModel_from_pretrained)
-            self.transformers_modeling_utils_load_pretrained_model = self.replace(transformers.modeling_utils.PreTrainedModel, '_load_pretrained_model', transformers_modeling_utils_load_pretrained_model)
-            self.transformers_tokenization_utils_base_cached_file = self.replace(transformers.tokenization_utils_base, 'cached_file', transformers_tokenization_utils_base_cached_file)
-            self.transformers_configuration_utils_cached_file = self.replace(transformers.configuration_utils, 'cached_file', transformers_configuration_utils_cached_file)
+            self.transformers_modeling_utils_load_pretrained_model = self.replace(_transformers_modeling_utils.PreTrainedModel, '_load_pretrained_model', transformers_modeling_utils_load_pretrained_model)
+            self.transformers_tokenization_utils_base_cached_file = self.replace(_transformers_tokenization_utils_base, 'cached_file', transformers_tokenization_utils_base_cached_file)
+            self.transformers_configuration_utils_cached_file = self.replace(_transformers_configuration_utils, 'cached_file', transformers_configuration_utils_cached_file)
             self.transformers_utils_hub_get_from_cache = self.replace(transformers.utils.hub, 'get_from_cache', transformers_utils_hub_get_from_cache)
             self.transformers_utils_hub_cached_files = self.replace(transformers.utils.hub, 'cached_files', transformers_utils_hub_cached_files)
 
