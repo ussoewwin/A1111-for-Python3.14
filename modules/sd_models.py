@@ -466,6 +466,23 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
         if cond is not None and hasattr(cond, 'transformer'):
             if sd_hijack_clip_utils.is_flat_clip_transformer(cond.transformer):
                 state_dict = sd_hijack_clip_utils.remap_sd1_clip_state_dict_for_flat_clip_text_model(state_dict)
+    # --- transformers 5.6+ flat CLIPTextModel: normalize checkpoint keys (isolated; no-op on 4.x/5.4) ---
+    try:
+        from modules import transformers_compat as _tfc
+        if _tfc.is_flat_clip_layout_active():
+            _prefixes = []
+            if getattr(model, 'is_sdxl', False) or hasattr(model, 'conditioner'):
+                _prefixes.append('conditioner.embedders.0.transformer.')
+                _prefixes.append('conditioner.embedders.1.transformer.')
+            elif hasattr(model, 'cond_stage_model') and hasattr(model.cond_stage_model, 'transformer'):
+                _prefixes.append('cond_stage_model.transformer.')
+            if _prefixes:
+                _n = _tfc.normalize_clip_state_dict_keys_for_flat_model(state_dict, tuple(_prefixes))
+                if _n:
+                    print(f'[TF5.6+] Normalized {_n} CLIP checkpoint keys to flattened layout')
+    except Exception as _e:
+        print(f'[TF5.6+] CLIP key normalization skipped: {_e}')
+
 
     model.load_state_dict(state_dict, strict=False)
     timer.record("apply weights to model")
