@@ -1,5 +1,7 @@
 # SDXL ConvRot INT8 / NVFP4 Checkpoint Support for A1111
 
+> **Status note (2026-10-19):** SDXL NVFP4 support was cancelled upstream (ComfyUI-HSWQ-Loader-and-Tools v3.6.1) and the NVFP4 dequantization code has been **removed from A1111** (`modules/sdxl_int8_convrot.py` now handles INT8 only; `format=nvfp4` layers are reported and left untouched). Sections below marked *NVFP4* describe the historical implementation and are kept for reference only.
+
 ## Technical Documentation
 
 ---

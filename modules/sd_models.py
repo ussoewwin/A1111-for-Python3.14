@@ -435,7 +435,7 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
     if model.is_ssd:
         sd_hijack.model_hijack.convert_sdxl_to_ssd(model)
 
-    # --- SDXL INT8/NVFP4 ConvRot: dequantize before cache + load_state_dict (完全隔離) ---
+    # --- SDXL ConvRot INT8: dequantize before cache + load_state_dict (isolated hook) ---
     try:
         from modules import sdxl_int8_convrot as _int8cr
         if _int8cr.state_dict_has_comfy_quant(state_dict):
@@ -446,10 +446,7 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
                   f"int8_convrot_linear={_stats.get('convrot_linear', 0)} "
                   f"int8_convrot_conv2d={_stats.get('convrot_conv2d', 0)} "
                   f"int8_skipped={_stats.get('skipped', 0)} "
-                  f"int8_already_float={_stats.get('already_float', 0)} "
-                  f"nvfp4_plain={_stats.get('nvfp4_plain', 0)} "
-                  f"nvfp4_convrot={_stats.get('nvfp4_convrot', 0)} "
-                  f"nvfp4_skipped={_stats.get('nvfp4_skipped', 0)}")
+                  f"int8_already_float={_stats.get('already_float', 0)}")
             timer.record("ConvRot dequantize")
     except Exception as _e:
         print(f"[ConvRot] WARNING: dequantize hook failed: {_e}")
