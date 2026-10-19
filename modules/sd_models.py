@@ -435,23 +435,24 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
     if model.is_ssd:
         sd_hijack.model_hijack.convert_sdxl_to_ssd(model)
 
-    # --- SDXL ConvRot INT8: dequantize before cache + load_state_dict (isolated hook) ---
+    # --- SDXL ConvRot INT8: install runtime INT8 modules before load_state_dict
+    # (isolated SDXL-only hook). Weight stays int8 in VRAM; forward runs a true
+    # W8A8 ConvRot GEMM (Linear: comfy_kitchen.int8_linear; Conv2d: rotate act ->
+    # im2col -> rowwise int8 quant -> torch._int_mm -> dequant epilogue).
+    # Gated on the SDXL family signature (conditioner.* present); SD1.5 packs are
+    # handled by the separate hook below.
     try:
-        from modules import sdxl_int8_convrot as _int8cr
-        # SDXL-family only: do not intercept SD1.5 ConvRot INT8 packs (the SD1.5
-        # hook below installs runtime INT8 modules instead of dequantizing).
-        if model.is_sdxl and _int8cr.state_dict_has_comfy_quant(state_dict):
-            _target_dt = torch.float32 if shared.cmd_opts.no_half else torch.float16
-            _stats = _int8cr.dequantize_state_dict(state_dict, target_dtype=_target_dt)
-            print(f"[ConvRot] Dequantized state_dict: "
-                  f"int8_plain={_stats.get('plain', 0)} "
-                  f"int8_convrot_linear={_stats.get('convrot_linear', 0)} "
-                  f"int8_convrot_conv2d={_stats.get('convrot_conv2d', 0)} "
-                  f"int8_skipped={_stats.get('skipped', 0)} "
-                  f"int8_already_float={_stats.get('already_float', 0)}")
-            timer.record("ConvRot dequantize")
+        from modules import sdxl_int8_convrot as _sdxlint8
+        if _sdxlint8.state_dict_is_sdxl_convrot_int8(state_dict):
+            _statsxl = _sdxlint8.build_runtime_int8(model, state_dict)
+            print(f"[SDXL ConvRot] Runtime INT8 modules installed: "
+                  f"conv2d={_statsxl.get('conv2d', 0)} "
+                  f"linear={_statsxl.get('linear', 0)} "
+                  f"skipped={_statsxl.get('skipped', 0)} "
+                  f"int8_weight_mb={_statsxl.get('int8_bytes', 0) / 1e6:.1f}")
+            timer.record("SDXL ConvRot runtime INT8")
     except Exception as _e:
-        print(f"[ConvRot] WARNING: dequantize hook failed: {_e}")
+        print(f"[SDXL ConvRot] WARNING: runtime INT8 hook failed: {_e}")
 
     # --- SD1.5 ConvRot INT8: install runtime INT8 modules before load_state_dict
     # (isolated SD1.5-only hook). Weight stays int8 in VRAM; forward runs a true
