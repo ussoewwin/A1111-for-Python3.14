@@ -1,6 +1,21 @@
-# Release Notes (v1.01 to v3.0.5)
+# Release Notes (v1.01 to v3.0.6)
 
-This document contains release notes for versions v1.01 through v3.0.5. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.0.6. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+
+---
+
+## v3.0.6
+
+### Added: True Runtime INT8 Execution for ConvRot INT8 Checkpoints (SD1.5 and SDXL)
+
+- **Added**: **SD1.5 ConvRot INT8 runtime support** — New `modules/sd15_int8_convrot.py` keeps the quantized weights resident as int8 instead of expanding them back to fp16, and runs a real W8A8 ConvRot GEMM: `comfy_kitchen.int8_linear` for Linear layers, and for Conv2d a rotated activation, im2col view, rowwise int8 quantization, `torch._int_mm` against the pre-rotated int8 weight, and a dequantization epilogue. The reference SD1.5 pack installs 282 layers (`conv2d=98 linear=184`) and holds 859.1 MB of int8 weights, against 1719.0 MB for the fp16 equivalent (`64d48fea`).
+- **Added**: **SDXL ConvRot INT8 runtime support** — `modules/sdxl_int8_convrot.py` was rewritten from a dequantize-to-fp16 hook into the same runtime INT8 design. The reference SDXL pack installs 686 layers and holds 2221.8 MB of int8 weights, against the fp16 expansion that previously made the model larger than the int8 pack itself (`afaf9e49`).
+- **Added**: **Quantized SDXL text encoders** — HSWQ SDXL packs also quantize the CLIP encoders (133 `conditioner.*` layers). Support now covers them: Linear and `NonDynamicallyQuantizableLinear` through the runtime INT8 Linear path, `token_embedding` through a row-gather Embedding shim, and the CLIP-G `out_proj` inside `nn.MultiheadAttention` through a parent-attention forward shim, because the fused projection is consumed functionally. CLIP-L checkpoint keys stored under `...transformer.text_model....` are re-keyed to the module namespace so the remaining float tensors (biases, LayerNorms) load correctly (`ca801ceb`).
+- **Changed**: **Module types preserved for LoRA compatibility** — The quantized modules keep their original `torch.nn.Conv2d` / `torch.nn.Linear` classes: the `weight` parameter is replaced in place with the int8 payload and an instance-level `forward` is bound. This keeps the LoRA extension's exact-type checks working, and `half()` / `cuda()` no longer affect the int8 payload. LoRA deltas are read from the extension's loaded networks (read-only) and baked into the int8 weights through `calc_updown`, then re-rotated and requantized.
+- **Fixed**: **Broken-layer detection in ConvRot INT8 packs** — Some layers in the published SDXL packs carry an all-zero int8 payload with a NaN weight scale (measured: CLIP-L layer 11, six layers). Such layers carry no weight information and would propagate NaN through the entire text encoder. They are now detected and left on the float path with an explicit warning instead of being silently quantized.
+- **Fixed**: **SDXL hook no longer intercepts SD1.5 packs** — The ConvRot INT8 gates are now exclusive: SDXL is matched on the `conditioner.*` signature and SD1.5 on `cond_stage_model.*`, so each checkpoint reaches exactly one code path.
+- **Summary**: Replaced the previous dequantize-to-fp16 behavior, which restored the full fp16 weight footprint and saved no VRAM, with real runtime INT8 execution for both SD1.5 and SDXL ConvRot INT8 checkpoints, including the quantized SDXL text encoders, while preserving LoRA application through the existing extension.
+- **Release Note**: [v3.0.6 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.6)
 
 ---
 
