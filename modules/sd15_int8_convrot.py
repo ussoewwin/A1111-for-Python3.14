@@ -176,13 +176,20 @@ def _collect_layer_confs(state_dict: dict) -> dict:
         prefix = k[: -len(".comfy_quant")]
         if (prefix + ".weight") not in state_dict:
             continue
+        try:
+            conf = _get_layer_conf(decode_comfy_quant_conf(state_dict[k]), prefix)
+        except Exception:
+            conf = {}
+        fmt = conf.get("format", "")
+        if fmt and fmt != "int8_tensorwise":
+            print(f"{_LOG} ERROR: {prefix} is format={fmt} - this runtime INT8 "
+                  f"path supports int8_tensorwise only. The layer is left "
+                  f"untouched (no silent corruption).")
+            continue
         w = state_dict[prefix + ".weight"]
         if not isinstance(w, torch.Tensor) or w.dtype != torch.int8:
             continue
-        try:
-            confs[prefix] = _get_layer_conf(decode_comfy_quant_conf(state_dict[k]), prefix)
-        except Exception:
-            confs[prefix] = {}
+        confs[prefix] = conf
     return confs
 
 
