@@ -172,9 +172,13 @@ def state_dict_is_sdxl_convrot_int8(state_dict: dict) -> bool:
 
 
 def _collect_layer_confs(state_dict: dict) -> dict:
+    """Collect int8 ConvRot layer prefixes for BOTH the UNet (model.diffusion_model.*)
+    and the SDXL text encoders (conditioner.*), which HSWQ packs also quantize."""
     confs = {}
     for k in list(state_dict.keys()):
-        if not (k.startswith(_PREFIX) and k.endswith(".comfy_quant")):
+        if not k.endswith(".comfy_quant"):
+            continue
+        if not (k.startswith(_PREFIX) or k.startswith("conditioner.")):
             continue
         prefix = k[: -len(".comfy_quant")]
         if (prefix + ".weight") not in state_dict:
@@ -401,6 +405,72 @@ def _linear_forward_shim(self, x):
     return _fp16_linear_forward(self, x)
 
 
+def _embedding_forward_shim(self, x):
+    """Runtime INT8 Embedding forward: gather int8 rows, dequantize, unrotate."""
+    ref = getattr(self, "_hswq_ref_param", None)
+    out_dtype = ref.dtype if isinstance(ref, torch.Tensor) else torch.float16
+    try:
+        gs = int(self._hswq_gs)
+        idx = x
+        wq = self.weight[idx]                      # int8 [*, dim]
+        sc = _scale_on(self.weight.device, self.weight_scale).reshape(-1)
+        s = sc[idx]                                # [*]
+        wf = wq.float() * s.unsqueeze(-1).float()
+        dim = wf.shape[-1]
+        if gs and dim % gs == 0:
+            wf = _unrotate_last_dim(
+                wf.reshape(-1, dim),
+                build_hadamard(gs, device=wf.device, dtype=torch.float32), gs,
+            ).reshape(wf.shape)
+        return wf.to(out_dtype)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("%s Embedding runtime INT8 path failed (%s); fp16 fallback", _LOG, e)
+        gs = int(self._hswq_gs)
+        sc = _scale_on(self.weight.device, self.weight_scale).reshape(-1, 1)
+        w = self.weight.float() * sc.float()
+        if gs and w.shape[1] % gs == 0:
+            w = _unrotate_last_dim(w, build_hadamard(gs, device=w.device, dtype=torch.float32), gs)
+        return torch.nn.functional.embedding(x, w.to(out_dtype))
+
+
+def _mha_forward_shim(self, query, key, value, key_padding_mask=None, need_weights=True,
+                      attn_mask=None, average_attn_weights=True, is_causal=False, **kwargs):
+    """MultiheadAttention forward whose out_proj is a runtime INT8 module.
+    Mirrors F.multi_head_attention_forward for the batch_first=True, q=k=v path
+    used by OpenCLIP, then routes the output projection through the int8 shim."""
+    import torch.nn.functional as F
+    batch_first = getattr(self, "batch_first", True)
+    if not batch_first:
+        query = query.transpose(0, 1)
+        key = key.transpose(0, 1)
+        value = value.transpose(0, 1)
+    B, T, E = query.shape
+    S = key.shape[1]
+    if self.in_proj_weight is not None:
+        qkv = F.linear(query, self.in_proj_weight, self.in_proj_bias)
+        q, k, v = qkv.chunk(3, dim=-1)
+    else:
+        q = F.linear(query, self.q_proj_weight, self.in_proj_bias)
+        k = F.linear(key, self.k_proj_weight, self.in_proj_bias)
+        v = F.linear(value, self.v_proj_weight, self.in_proj_bias)
+    nh = self.num_heads
+    hd = E // nh
+    q = q.reshape(B, T, nh, hd).transpose(1, 2)
+    k = k.reshape(B, S, nh, hd).transpose(1, 2)
+    v = v.reshape(B, S, nh, hd).transpose(1, 2)
+    out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=bool(is_causal))
+    out = out.transpose(1, 2).reshape(B, T, E).contiguous()
+    if self.out_proj.weight.dtype == torch.int8:
+        out = self.out_proj(out)   # runtime INT8 out_proj shim
+    else:
+        out = self.out_proj(out)
+    if not batch_first:
+        out = out.transpose(0, 1)
+    if need_weights:
+        return out, None
+    return out, None
+
+
 # ---------------------------------------------------------------------------
 # Installation
 # ---------------------------------------------------------------------------
@@ -418,6 +488,15 @@ def _install_convrot(mod, qw, sc, gs, bias):
     mod.forward = types.MethodType(_conv2d_forward_shim, mod)
 
 
+def _install_embedding(mod, qw, sc, gs, ref_param=None):
+    mod.weight = torch.nn.Parameter(qw.to(torch.int8).clone(), requires_grad=False)
+    mod.weight_scale = sc.reshape(-1).float()[: mod.weight.shape[0]].clone()
+    mod._hswq_kind = "embedding"
+    mod._hswq_gs = int(gs)
+    mod._hswq_ref_param = ref_param
+    mod.forward = types.MethodType(_embedding_forward_shim, mod)
+
+
 def _install_convrot_linear(mod, qw, sc, gs, bias):
     mod.weight = torch.nn.Parameter(qw.to(torch.int8).clone(), requires_grad=False)
     mod.weight_scale = sc.reshape(-1).float()[: mod.weight.shape[0]].reshape(-1, 1).clone()
@@ -431,16 +510,49 @@ def _install_convrot_linear(mod, qw, sc, gs, bias):
     mod.forward = types.MethodType(_linear_forward_shim, mod)
 
 
+def _resolve_mod(name_to_mod, prefix):
+    """Find the model module for a pack key (the pack uses .text_model. where the
+    A1111 module namespace does not)."""
+    if prefix in name_to_mod:
+        return prefix, name_to_mod[prefix]
+    if ".text_model." in prefix:
+        alt = prefix.replace(".text_model.", ".")
+        if alt in name_to_mod:
+            return alt, name_to_mod[alt]
+    return None, None
+
+
+def _layer_scale_is_broken(sc, qw):
+    """HSWQ packs can ship layers with an all-zero int8 payload and NaN weights
+    scale (measured: CLIP-L layer 11 in both published SDXL packs). Such a layer
+    carries no weight information at all; feeding it to the INT8 path
+    propagates NaN through the whole text encoder. Detect it so we can degrade
+    that single layer safely instead of poisoning the model."""
+    if sc is None:
+        return False
+    s = sc.float()
+    return bool(torch.isnan(s).any() or torch.isinf(s).any()) or bool((qw == 0).all())
+
+
 def install_runtime_int8_modules(model, state_dict) -> dict:
-    """Swap the int8 payload into the existing Conv2d / Linear modules."""
+    """Swap the int8 payload into the existing Conv2d / Linear / Embedding modules.
+
+    Covers both the UNet (model.diffusion_model.*) and the SDXL text encoders
+    (conditioner.*) that HSWQ packs also quantize. CLIP-G out_proj layers live
+    inside an nn.MultiheadAttention and are used through
+    F.multi_head_attention_forward, so the parent MHA forward is shimmed too.
+    """
     confs = _collect_layer_confs(state_dict)
     name_to_mod = dict(model.named_modules())
-    stats = {"conv2d": 0, "linear": 0, "skipped": 0, "int8_bytes": 0}
+    # None (int8 disabled) -> float; resolved lazily from the module's dtype.
+    stats = {"conv2d": 0, "linear": 0, "embedding": 0, "mha": 0,
+             "skipped": 0, "int8_bytes": 0}
 
     for prefix, conf in confs.items():
-        mod = name_to_mod.get(prefix)
+        _, mod = _resolve_mod(name_to_mod, prefix)
         if mod is None:
             stats["skipped"] += 1
+            logger.warning("%s no module for %s", _LOG, prefix)
             continue
         gs = int(conf.get("convrot_groupsize", 256) or 256)
         qw = state_dict.get(prefix + ".weight")
@@ -449,16 +561,57 @@ def install_runtime_int8_modules(model, state_dict) -> dict:
         if qw is None or sc is None:
             stats["skipped"] += 1
             continue
-        if isinstance(mod, torch.nn.Conv2d) and type(mod) is torch.nn.Conv2d:
+
+        # Detect pack-level corruption (all-zero int8 + NaN scale). Leave the
+        # module on its original float path and report it explicitly; silently
+        # producing NaN is worse than an honest, local degradation.
+        if _layer_scale_is_broken(sc, qw):
+            logger.warning(
+                "%s layer %s has a broken int8 payload (all-zero weight / NaN scale) "
+                "in the checkpoint; keeping it on the float path. Re-quantize the "
+                "source model to fix it.", _LOG, prefix)
+            stats["broken"] = stats.get("broken", 0) + 1
+            continue
+
+        # out_proj inside an nn.MultiheadAttention: install int8 on the child and
+        # shim the parent's forward so it routes through the child module.
+        parent_name = ".".join(prefix.split(".")[:-1])
+        _, parent = _resolve_mod(name_to_mod, parent_name)
+        if isinstance(parent, torch.nn.MultiheadAttention):
+            _install_convrot_linear(mod, qw, sc, gs, b)
+            if not getattr(parent, "_hswq_mha_shimmed", False):
+                parent.forward = types.MethodType(_mha_forward_shim, parent)
+                parent._hswq_mha_shimmed = True
+            stats["mha"] += 1
+            stats["int8_bytes"] += qw.numel()
+        elif isinstance(mod, torch.nn.Conv2d) and type(mod) is torch.nn.Conv2d:
             _install_convrot(mod, qw, sc, gs, b)
             stats["conv2d"] += 1
             stats["int8_bytes"] += qw.numel()
-        elif isinstance(mod, torch.nn.Linear) and type(mod) is torch.nn.Linear:
+        elif isinstance(mod, torch.nn.Linear) and type(mod) in (torch.nn.Linear,):
+            _install_convrot_linear(mod, qw, sc, gs, b)
+            stats["linear"] += 1
+            stats["int8_bytes"] += qw.numel()
+        elif isinstance(mod, torch.nn.Embedding):
+            # token_embedding: its output is added to positional_embedding, so it
+            # must match that parameter's dtype.
+            emb_parent = model
+            for part in prefix.split(".")[:-1]:
+                emb_parent = getattr(emb_parent, part, None)
+                if emb_parent is None:
+                    break
+            ref = getattr(emb_parent, "positional_embedding", None) if emb_parent is not None else None
+            _install_embedding(mod, qw, sc, gs, ref_param=ref)
+            stats["embedding"] += 1
+            stats["int8_bytes"] += qw.numel()
+        elif isinstance(mod, torch.nn.Linear):
+            # NonDynamicallyQuantizableLinear that is NOT under an MHA.
             _install_convrot_linear(mod, qw, sc, gs, b)
             stats["linear"] += 1
             stats["int8_bytes"] += qw.numel()
         else:
             stats["skipped"] += 1
+            logger.warning("%s unsupported target %s (%s)", _LOG, prefix, type(mod).__name__)
 
     return stats
 
@@ -466,11 +619,43 @@ def install_runtime_int8_modules(model, state_dict) -> dict:
 def build_runtime_int8(model, state_dict) -> dict:
     """Entry point from sd_models.py: install runtime INT8 modules then strip the
     int8 sidecar keys so the subsequent load_state_dict only sees the plain-float
-    tensors it still needs (CLIP / VAE / non-converted)."""
+    tensors it still needs (CLIP / VAE / non-converted).
+
+    HSWQ SDXL packs store CLIP-L under `...transformer.text_model....` while the
+    A1111 OpenCLIP module namespace is `...transformer....`. The int8 layers are
+    matched through that normalization, so the remaining float tensors (biases,
+    norms) are re-keyed here too; otherwise CLIP-L biases would never load and
+    the text encoder would produce NaN. Strictly scoped to this SDXL int8 path.
+    """
     confs = _collect_layer_confs(state_dict)
     stats = install_runtime_int8_modules(model, state_dict)
+    broken = set()
     for prefix in confs:
+        qw = state_dict.get(prefix + ".weight")
+        sc = state_dict.get(prefix + ".weight_scale")
+        if qw is not None and _layer_scale_is_broken(sc, qw):
+            broken.add(prefix)
+    for prefix in confs:
+        if prefix in broken:
+            # Keep the float weight key so the layer still receives whatever the
+            # checkpoint carries; only the int8 sidecars are removed.
+            for suffix in (".weight_scale", ".comfy_quant", ".input_scale",
+                           ".weight_scale_2", ".pre_quant_scale"):
+                state_dict.pop(prefix + suffix, None)
+            continue
         for suffix in (".weight", ".weight_scale", ".comfy_quant",
                        ".input_scale", ".weight_scale_2", ".pre_quant_scale"):
             state_dict.pop(prefix + suffix, None)
+
+    # Re-key the CLIP-L namespace to match the A1111 module names.
+    cl = "conditioner.embedders.0.transformer.text_model."
+    if any(k.startswith(cl) for k in state_dict):
+        moved = 0
+        for k in [k for k in state_dict if k.startswith(cl)]:
+            nk = "conditioner.embedders.0.transformer." + k[len(cl):]
+            if nk not in state_dict:
+                state_dict[nk] = state_dict.pop(k)
+                moved += 1
+        if moved:
+            logger.info("%s re-keyed %d CLIP-L tensors to the A1111 namespace", _LOG, moved)
     return stats
