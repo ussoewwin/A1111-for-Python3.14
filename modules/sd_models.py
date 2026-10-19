@@ -438,7 +438,9 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
     # --- SDXL ConvRot INT8: dequantize before cache + load_state_dict (isolated hook) ---
     try:
         from modules import sdxl_int8_convrot as _int8cr
-        if _int8cr.state_dict_has_comfy_quant(state_dict):
+        # SDXL-family only: do not intercept SD1.5 ConvRot INT8 packs (the SD1.5
+        # hook below installs runtime INT8 modules instead of dequantizing).
+        if model.is_sdxl and _int8cr.state_dict_has_comfy_quant(state_dict):
             _target_dt = torch.float32 if shared.cmd_opts.no_half else torch.float16
             _stats = _int8cr.dequantize_state_dict(state_dict, target_dtype=_target_dt)
             print(f"[ConvRot] Dequantized state_dict: "
@@ -450,6 +452,26 @@ def load_model_weights(model, checkpoint_info: CheckpointInfo, state_dict, timer
             timer.record("ConvRot dequantize")
     except Exception as _e:
         print(f"[ConvRot] WARNING: dequantize hook failed: {_e}")
+
+    # --- SD1.5 ConvRot INT8: install runtime INT8 modules before load_state_dict
+    # (isolated SD1.5-only hook). Weight stays int8 in VRAM; forward runs a true
+    # W8A8 ConvRot GEMM (Linear: comfy_kitchen.int8_linear; Conv2d: rotate act ->
+    # im2col -> rowwise int8 quant -> torch._int_mm -> dequant epilogue).
+    # Gated on the SD1.5 family signature (cond_stage_model.*, no conditioner.*).
+    # SD1.5 checkpoint support ported from the HSWQ ComfyUI loader SD1.5 ConvRot INT8
+    # development; SDXL keeps its own hook above and is untouched by this branch.
+    try:
+        from modules import sd15_int8_convrot as _sd15int8
+        if _sd15int8.state_dict_is_sd15_convrot_int8(state_dict):
+            _stats15 = _sd15int8.build_runtime_int8(model, state_dict)
+            print(f"[SD1.5 ConvRot] Runtime INT8 modules installed: "
+                  f"conv2d={_stats15.get('conv2d', 0)} "
+                  f"linear={_stats15.get('linear', 0)} "
+                  f"skipped={_stats15.get('skipped', 0)} "
+                  f"int8_weight_mb={_stats15.get('int8_bytes', 0) / 1e6:.1f}")
+            timer.record("SD1.5 ConvRot runtime INT8")
+    except Exception as _e:
+        print(f"[SD1.5 ConvRot] WARNING: runtime INT8 hook failed: {_e}")
 
     if shared.opts.sd_checkpoint_cache > 0:
         # cache newly loaded model (after dequantize, so cache has float weights)
