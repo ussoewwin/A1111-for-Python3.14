@@ -807,6 +807,55 @@ def prepare_environment():
 
     fix_clip_packaging_import()
 
+    # Fix setuptools 84+ pkg_resources removal (setuptools 81+ dropped
+    # pkg_resources; lightning_fabric's legacy namespace shim still imports it
+    # and crashed startup with ModuleNotFoundError before `import webui`).
+    def fix_pkg_resources_removal():
+        if platform.system() == "Windows":
+            sp_dir = os.path.join(script_path, "venv", "Lib", "site-packages")
+        else:
+            py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+            sp_dir = os.path.join(script_path, "venv", "lib", py_ver, "site-packages")
+        legacy_shim = '__import__("pkg_resources").declare_namespace(__name__)'
+        legacy_shim_alt = "__import__('pkg_resources').declare_namespace(__name__)"
+        replacement = (
+            "# pkg_resources removed in setuptools 81+; legacy namespace shim is a"
+            " no-op for this normal package\n"
+            "pass"
+        )
+        for pkg_init in (
+            os.path.join(sp_dir, "lightning_fabric", "__init__.py"),
+            os.path.join(sp_dir, "pytorch_lightning", "__init__.py"),
+        ):
+            if not os.path.isfile(pkg_init):
+                continue
+            try:
+                with open(pkg_init, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if legacy_shim in content:
+                    content = content.replace(legacy_shim, replacement)
+                elif legacy_shim_alt in content:
+                    content = content.replace(legacy_shim_alt, replacement)
+                else:
+                    continue
+                with open(pkg_init, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print(f"[INFO] Fixed pkg_resources removal in {os.path.relpath(pkg_init, sp_dir)}: replaced legacy namespace shim")
+            except Exception as e:
+                print(f"[WARNING] Could not auto-fix {pkg_init}: {e}")
+
+        try:
+            from importlib.metadata import version as _v
+            st_version = _v("setuptools")
+            st_major = int(st_version.split(".")[0])
+            if st_major >= 82:
+                print(f"[INFO] setuptools {st_version} violates the requirements pin (<82) and no longer ships pkg_resources; restoring setuptools 80.9.0")
+                run(f'"{python}" -m pip install setuptools==80.9.0 --no-deps', "Restoring setuptools<82 (pkg_resources)", "Couldn't restore setuptools<82", live=False)
+        except Exception as e:
+            print(f"[WARNING] setuptools pin check skipped: {e}")
+
+    fix_pkg_resources_removal()
+
     # Fix protobuf runtime_version import error
     try:
         from google.protobuf import runtime_version
