@@ -763,9 +763,9 @@ def prepare_environment():
 
     if fa2_install_enabled and not is_installed("flash_attn"):
         if platform.system() == "Linux":
-            # Source build: setup.py needs these present in the venv because the
-            # install runs with --no-build-isolation.
-            for build_dep in ("ninja", "psutil", "packaging", "einops"):
+            # Source build with --no-build-isolation: setup.py's setup_requires
+            # (packaging, psutil, ninja) must already be in the venv.
+            for build_dep in ("packaging", "psutil", "ninja"):
                 if not is_installed(build_dep):
                     run_pip(f"install {build_dep}", build_dep)
             run_pip(f"install {flash_attn_package} --no-build-isolation", "flash_attn")

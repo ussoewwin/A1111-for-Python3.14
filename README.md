@@ -195,9 +195,9 @@ Pick the section for your OS and follow the steps in order.
    pip install importlib_metadata onnx polygraphy coloredlogs flatbuffers packaging protobuf sympy
    ```
 
-6. Install Triton (stock PyPI manylinux wheel) and the Flash-Attention 2 build prerequisites:
+6. Install Triton (stock PyPI manylinux wheel):
    ```bash
-   pip install triton ninja psutil packaging einops
+   pip install triton
    ```
 
 7. ONNX Runtime GPU is installed automatically on first launch (`modules/launch_utils.py`):
