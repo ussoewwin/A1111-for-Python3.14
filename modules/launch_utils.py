@@ -522,6 +522,48 @@ def requirements_met(requirements_file):
     return True
 
 
+def _cuda_compute_capability_major() -> int | None:
+    """Return the CUDA compute capability major of the local GPU, or None."""
+    result = subprocess.run(
+        [python, "-c", "import torch; print(torch.cuda.get_device_capability()[0])"],
+        capture_output=True,
+        shell=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int((result.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+def _windows_fa2_wheel() -> str:
+    """Pick the Flash-Attention 2 Windows wheel that matches the local GPU.
+
+    The fork publishes one cp314 wheel per architecture family for this stack:
+    .blackwell (sm_100 / sm_120 / sm_121) and .legacy (sm_80 / sm_89 / sm_90).
+    """
+    template = (
+        "https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/"
+        "flash_attn-2.9.2.post2%2Bcu134torch2.15.0cxx11abiTRUE.{}-cp314-cp314-win_amd64.whl"
+        "?download=true"
+    )
+    cc_major = _cuda_compute_capability_major()
+    if cc_major is None:
+        print(
+            "[WARNING] Could not detect the GPU compute capability; using the Blackwell "
+            "Flash-Attention 2 wheel. Set FLASH_ATTN_PACKAGE to override."
+        )
+        variant = "blackwell"
+    elif cc_major >= 10:
+        variant = "blackwell"
+    else:
+        variant = "legacy"
+    print(f"Flash-Attention 2 wheel: {variant} (compute capability major {cc_major})")
+    return template.format(variant)
+
+
 def prepare_environment():
     # Platform defaults (overridable via TORCH_COMMAND / TORCH_INDEX_URL / webui-macos-env.sh):
     #   Windows / Linux CUDA: torch 2.15.0+cu134 + torchvision 0.29.2+cu134 (FA2 cu134 stack)
@@ -576,7 +618,8 @@ def prepare_environment():
     #   Linux:   source build via PyPI flash-attn==2.8.4 (CUDA toolkit 13.4 + nvcc, ~30min compile)
     #   Mac:     skipped (FA2 requires CUDA; MPS backend cannot use it)
     if platform.system() == "Windows":
-        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/flash_attn-2.9.2.post2%2Bcu134torch2.15.0cxx11abiTRUE.blackwell-cp314-cp314-win_amd64.whl')
+        # Resolved at install time from the local GPU architecture (see _windows_fa2_wheel).
+        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE')
         fa2_install_enabled = True
     elif platform.system() == "Linux":
         flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'flash-attn==2.8.4')
@@ -723,6 +766,8 @@ def prepare_environment():
         if platform.system() == "Linux":
             run_pip(f"install {flash_attn_package} --no-build-isolation", "flash_attn")
         else:
+            if not flash_attn_package:
+                flash_attn_package = _windows_fa2_wheel()
             run_pip(f"install {flash_attn_package}", "flash_attn")
         startup_timer.record("install flash_attn")
 
