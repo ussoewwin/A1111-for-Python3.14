@@ -573,13 +573,13 @@ def prepare_environment():
     openclip_package = os.environ.get('OPENCLIP_PACKAGE', "https://github.com/mlfoundations/open_clip/archive/bb6e834e9c70d9c27d0dc3ecedeebeaeb1ffad6b.zip")
     # Flash-Attention 2 source is platform-specific (same torch 2.15.0+cu134 baseline on Win/Linux):
     #   Windows: prebuilt wheel (cu134 + torch 2.15.0, cp314)
-    #   Linux:   source build via PyPI flash-attn==2.9.2.post2 (CUDA toolkit 13.4 + nvcc, ~30min compile)
+    #   Linux:   source build via PyPI flash-attn==2.8.4 (CUDA toolkit 13.4 + nvcc, ~30min compile)
     #   Mac:     skipped (FA2 requires CUDA; MPS backend cannot use it)
     if platform.system() == "Windows":
         flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/flash_attn-2.9.2.post2%2Bcu134torch2.15.0cxx11abiTRUE.blackwell-cp314-cp314-win_amd64.whl')
         fa2_install_enabled = True
     elif platform.system() == "Linux":
-        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'flash-attn==2.9.2.post2')
+        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'flash-attn==2.8.4')
         fa2_install_enabled = True
     else:
         flash_attn_package = None
