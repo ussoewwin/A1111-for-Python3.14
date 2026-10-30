@@ -807,6 +807,48 @@ def prepare_environment():
 
     fix_clip_packaging_import()
 
+    # Fix lightning_fabric / pytorch_lightning legacy namespace shims:
+    # setuptools 81+ removed pkg_resources, but their __init__.py still calls
+    # __import__("pkg_resources").declare_namespace(__name__), which crashes
+    # startup with ModuleNotFoundError before `import webui`. Both are normal
+    # packages here, so the shim is safe to no-op (same auto-fix pattern as
+    # fix_clip_packaging_import). No package version is changed.
+    def fix_lightning_pkg_resources_shim():
+        if platform.system() == "Windows":
+            sp_dir = os.path.join(script_path, "venv", "Lib", "site-packages")
+        else:
+            py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+            sp_dir = os.path.join(script_path, "venv", "lib", py_ver, "site-packages")
+        legacy_shim = '__import__("pkg_resources").declare_namespace(__name__)'
+        legacy_shim_alt = "__import__('pkg_resources').declare_namespace(__name__)"
+        replacement = (
+            "# pkg_resources removed in setuptools 81+; legacy namespace shim is a"
+            " no-op for this normal package\n"
+            "pass"
+        )
+        for pkg_init in (
+            os.path.join(sp_dir, "lightning_fabric", "__init__.py"),
+            os.path.join(sp_dir, "pytorch_lightning", "__init__.py"),
+        ):
+            if not os.path.isfile(pkg_init):
+                continue
+            try:
+                with open(pkg_init, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if legacy_shim in content:
+                    content = content.replace(legacy_shim, replacement)
+                elif legacy_shim_alt in content:
+                    content = content.replace(legacy_shim_alt, replacement)
+                else:
+                    continue
+                with open(pkg_init, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print(f"[INFO] Fixed pkg_resources removal in {os.path.relpath(pkg_init, sp_dir)}: replaced legacy namespace shim")
+            except Exception as e:
+                print(f"[WARNING] Could not auto-fix {pkg_init}: {e}")
+
+    fix_lightning_pkg_resources_shim()
+
     # Fix protobuf runtime_version import error
     try:
         from google.protobuf import runtime_version
