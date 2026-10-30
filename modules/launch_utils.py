@@ -568,7 +568,6 @@ def prepare_environment():
     # Platform defaults (overridable via TORCH_COMMAND / TORCH_INDEX_URL / webui-macos-env.sh):
     #   Windows / Linux CUDA: torch 2.15.0+cu134 + torchvision 0.29.2+cu134 (FA2 cu134 stack)
     #   Darwin (macOS):       torch 2.15.0 + torchvision 0.29.1 from cpu index (MPS; FA2 skipped)
-    # torchaudio is omitted: A1111 image paths do not require it.
     is_darwin = platform.system() == "Darwin"
     if is_darwin:
         torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cpu")
