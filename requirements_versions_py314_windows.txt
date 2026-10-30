@@ -48,9 +48,9 @@ opencv-python>=4.9.0
 svglib
 addict
 yapf
-albumentations==1.4.3
+albumentations>=1.4.3
 matplotlib
-pydantic==1.10.25
+pydantic>=1.10.25
 controlnet_aux>=0.0.9
 ultralytics>=8.3.75
 rich>=13.0.0
