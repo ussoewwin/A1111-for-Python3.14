@@ -148,8 +148,8 @@ def _torch_stack_versions(*, cuda_required: bool) -> tuple[str, str] | None:
     """
     Return (torch.__version__, torchvision.__version__) from the live interpreter.
 
-    Do NOT use importlib.metadata.version("torch"): it strips local tags (+cu132) and
-    writes torch==2.13.0, which pip can satisfy with a PyPI CPU wheel on CUDA platforms.
+    Do NOT use importlib.metadata.version("torch"): it strips local tags (+cu134) and
+    writes torch==2.15.0, which pip can satisfy with a PyPI CPU wheel on CUDA platforms.
     """
     if cuda_required:
         code = (
@@ -169,7 +169,7 @@ def _torch_stack_versions(*, cuda_required: bool) -> tuple[str, str] | None:
         return None
     torch_ver, tv_ver = lines[0], lines[1]
     if cuda_required and ("+" not in torch_ver or "+cpu" in torch_ver.lower()):
-        # Bare 2.13.0 on a CUDA host is the CPU-swap footgun — refuse to pin it.
+        # Bare 2.15.0 on a CUDA host is the CPU-swap footgun — refuse to pin it.
         return None
     return torch_ver, tv_ver
 
@@ -197,7 +197,7 @@ def _apply_torch_stack_pip_constraint(
         return
     os.environ["PIP_CONSTRAINT"] = path
     default_index = (
-        "https://download.pytorch.org/whl/cu132"
+        "https://download.pytorch.org/whl/cu134"
         if cuda_required
         else "https://download.pytorch.org/whl/cpu"
     )
@@ -524,21 +524,21 @@ def requirements_met(requirements_file):
 
 def prepare_environment():
     # Platform defaults (overridable via TORCH_COMMAND / TORCH_INDEX_URL / webui-macos-env.sh):
-    #   Windows / Linux CUDA: torch 2.13.0+cu132 + torchvision 0.28.0+cu132 (FA2 cu132 stack)
-    #   Darwin (macOS):       torch 2.13.0 + torchvision 0.28.0 from cpu index (MPS; FA2 skipped)
-    # torchaudio is omitted: official cu132 index has no torchaudio wheels; A1111 image paths do not require it.
+    #   Windows / Linux CUDA: torch 2.15.0+cu134 + torchvision 0.29.2+cu134 (FA2 cu134 stack)
+    #   Darwin (macOS):       torch 2.15.0 + torchvision 0.29.1 from cpu index (MPS; FA2 skipped)
+    # torchaudio is omitted: A1111 image paths do not require it.
     is_darwin = platform.system() == "Darwin"
     if is_darwin:
         torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cpu")
         torch_command = os.environ.get(
             'TORCH_COMMAND',
-            f"pip install torch==2.13.0 torchvision==0.28.0 --index-url {torch_index_url}",
+            f"pip install torch==2.15.0 torchvision==0.29.1 --index-url {torch_index_url}",
         )
     else:
-        torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu132")
+        torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu134")
         torch_command = os.environ.get(
             'TORCH_COMMAND',
-            f"pip install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --index-url {torch_index_url}",
+            f"pip install torch==2.15.0+cu134 torchvision==0.29.2+cu134 --index-url {torch_index_url}",
         )
     if args.use_ipex:
         if platform.system() == "Windows":
@@ -571,15 +571,15 @@ def prepare_environment():
     # (evaluation.CLIPFeatureExtractor). WebUI sampling does not import that path;
     # repositories/k-diffusion was patched so package import no longer pulls it in.
     openclip_package = os.environ.get('OPENCLIP_PACKAGE', "https://github.com/mlfoundations/open_clip/archive/bb6e834e9c70d9c27d0dc3ecedeebeaeb1ffad6b.zip")
-    # Flash-Attention 2 source is platform-specific (same torch 2.13.0+cu132 baseline on Win/Linux):
-    #   Windows: prebuilt wheel (cu132 + torch 2.13.0, cp314)
-    #   Linux:   source build via PyPI flash-attn==2.8.4 (CUDA toolkit 13.2 + nvcc, ~30min compile)
+    # Flash-Attention 2 source is platform-specific (same torch 2.15.0+cu134 baseline on Win/Linux):
+    #   Windows: prebuilt wheel (cu134 + torch 2.15.0, cp314)
+    #   Linux:   source build via PyPI flash-attn==2.9.2.post2 (CUDA toolkit 13.4 + nvcc, ~30min compile)
     #   Mac:     skipped (FA2 requires CUDA; MPS backend cannot use it)
     if platform.system() == "Windows":
-        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/flash_attn-2.8.4%2Bcu132torch2.13.0cxx11abiTRUE-cp314-cp314-win_amd64.whl')
+        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/flash_attn-2.9.2.post2%2Bcu134torch2.15.0cxx11abiTRUE.blackwell-cp314-cp314-win_amd64.whl')
         fa2_install_enabled = True
     elif platform.system() == "Linux":
-        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'flash-attn==2.8.4')
+        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'flash-attn==2.9.2.post2')
         fa2_install_enabled = True
     else:
         flash_attn_package = None
@@ -693,7 +693,7 @@ def prepare_environment():
         print("[INFO] Installed numpy==2.5.4 from PyPI")
 
     # Pin installed torch before requirements / extension installers can replace the stack.
-    # CUDA hosts: pin full local tags (+cu132) so pip cannot swap to PyPI CPU.
+    # CUDA hosts: pin full local tags (+cu134) so pip cannot swap to PyPI CPU.
     # Darwin / IPEX: pin installed versions without requiring CUDA.
     cuda_torch_required = not is_darwin and not args.use_ipex
     if is_installed("torch"):
