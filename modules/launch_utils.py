@@ -614,14 +614,18 @@ def prepare_environment():
     openclip_package = os.environ.get('OPENCLIP_PACKAGE', "https://github.com/mlfoundations/open_clip/archive/bb6e834e9c70d9c27d0dc3ecedeebeaeb1ffad6b.zip")
     # Flash-Attention 2 source is platform-specific (same torch 2.15.0+cu134 baseline on Win/Linux):
     #   Windows: prebuilt wheel (cu134 + torch 2.15.0, cp314)
-    #   Linux:   source build via PyPI flash-attn==2.8.4 (CUDA toolkit 13.4 + nvcc, ~30min compile)
+    #   Linux:   source build from the upstream tree at the commit that declares 2.8.4
+    #            (PyPI has no 2.8.4 release; upstream main is 2.8.4). CUDA toolkit 13.4 + nvcc, ~30min compile
     #   Mac:     skipped (FA2 requires CUDA; MPS backend cannot use it)
     if platform.system() == "Windows":
         # Resolved at install time from the local GPU architecture (see _windows_fa2_wheel).
         flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE')
         fa2_install_enabled = True
     elif platform.system() == "Linux":
-        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE', 'flash-attn==2.8.4')
+        flash_attn_package = os.environ.get(
+            'FLASH_ATTN_PACKAGE',
+            'git+https://github.com/Dao-AILab/flash-attention.git@819ef26aae39a1838d0597090880e044230d9261',
+        )
         fa2_install_enabled = True
     else:
         flash_attn_package = None
@@ -763,6 +767,11 @@ def prepare_environment():
 
     if fa2_install_enabled and not is_installed("flash_attn"):
         if platform.system() == "Linux":
+            # Source build: setup.py needs these present in the venv because the
+            # install runs with --no-build-isolation.
+            for build_dep in ("ninja", "psutil", "packaging", "einops"):
+                if not is_installed(build_dep):
+                    run_pip(f"install {build_dep}", build_dep)
             run_pip(f"install {flash_attn_package} --no-build-isolation", "flash_attn")
         else:
             if not flash_attn_package:

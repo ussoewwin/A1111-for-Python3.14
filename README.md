@@ -53,7 +53,7 @@ Direct Flash-Attention 2 support with staged fallback:
 3. sub_quad (built-in) — universal fallback
 ```
 
-Windows: prebuilt HF wheel (`2.9.2.post2+cu134torch2.15.0` cp314), picked by GPU compute capability — `blackwell` for sm_100/120/121, `legacy` for sm_80/89/90. Linux: builds `flash-attn==2.8.4` from source against the same `torch==2.15.0+cu134` stack (CUDA toolkit 13.4 + `nvcc`). macOS skips FA2 (MPS limitation).
+Windows: prebuilt HF wheel (`2.9.2.post2+cu134torch2.15.0` cp314), picked by GPU compute capability — `blackwell` for sm_100/120/121, `legacy` for sm_80/89/90. Linux: builds Flash-Attention 2 **2.8.4** from the upstream source tree (PyPI has no 2.8.4 release) against the same `torch==2.15.0+cu134` stack (CUDA toolkit 13.4 + `nvcc`). macOS skips FA2 (MPS limitation).
 
 
 ### ConvRot INT8 Checkpoints (SD1.5 and SDXL) (v3.0.1+, runtime INT8 in v3.0.6)
@@ -85,7 +85,7 @@ Other Python versions are not supported. Please ensure you are using Python 3.14
 | Platform | Status | Notes |
 |----------|--------|-------|
 | Windows  | Fully supported | PyTorch `2.15.0+cu134`; FA2 prebuilt `2.9.2.post2+cu134torch2.15.0` (blackwell / legacy by GPU arch); NumPy / SciPy from PyPI; Insightface via pip |
-| Linux    | Supported | Same PyTorch `2.15.0+cu134` / `torchvision==0.29.2+cu134`; FA2 source-builds `flash-attn==2.8.4` (CUDA toolkit **13.4** + `nvcc`, ~30 min) |
+| Linux    | Supported | Same PyTorch `2.15.0+cu134` / `torchvision==0.29.2+cu134`; FA2 source-builds 2.8.4 from upstream (CUDA toolkit **13.4** + `nvcc`, ~30 min) |
 | macOS    | Supported (limited) | PyTorch `2.15.0` CPU/MPS (`torchvision==0.29.1`); Flash-Attention 2 is skipped (CUDA required; MPS cannot use FA2) |
 
 All platform-specific handling is performed automatically by `modules/launch_utils.py` at startup. This fork supports **Python 3.14 only**. Linux / macOS branches are additive (FA2 path, venv `site-packages` layout for `clip.py` auto-fix).
@@ -97,7 +97,7 @@ The following packages are installed automatically during initial setup (see `mo
 - **PyTorch** (suggested manual install): `2.15.0+cu134` with matching `torchvision==0.29.2+cu134` (override with `TORCH_COMMAND` / `TORCH_INDEX_URL` as needed; matches FA2 `cu134torch2.15.0`)
 - **Flash-Attention 2**:
   - Windows: `flash_attn` `2.9.2.post2+cu134torch2.15.0` cp314 prebuilt wheel (HF), `blackwell` for compute capability major >= 10 (sm_100/120/121) and `legacy` otherwise (sm_80/89/90)
-  - Linux: `flash-attn==2.8.4` (PyPI source build against `torch==2.15.0+cu134`; CUDA toolkit 13.4 + `nvcc`; `--no-build-isolation`)
+  - Linux: Flash-Attention 2 **2.8.4** from the upstream source tree — `git+https://github.com/Dao-AILab/flash-attention.git@819ef26aae39a1838d0597090880e044230d9261` (the commit whose `flash_attn/__init__.py` declares `2.8.4`; PyPI publishes no 2.8.4). Source build against `torch==2.15.0+cu134`; CUDA toolkit 13.4 + `nvcc`; `--no-build-isolation`
   - macOS: skipped
 - **transformers**: >=5.6.2 (flattened CLIPTextModel compatibility; verified on 5.20.1)
 - **protobuf**: 7.34.1
@@ -195,9 +195,9 @@ Pick the section for your OS and follow the steps in order.
    pip install importlib_metadata onnx polygraphy coloredlogs flatbuffers packaging protobuf sympy
    ```
 
-6. Install Triton (stock PyPI manylinux wheel):
+6. Install Triton (stock PyPI manylinux wheel) and the Flash-Attention 2 build prerequisites:
    ```bash
-   pip install triton
+   pip install triton ninja psutil packaging einops
    ```
 
 7. ONNX Runtime GPU is installed automatically on first launch (`modules/launch_utils.py`):
@@ -271,7 +271,7 @@ Pick the section for your OS and follow the steps in order.
 
 - **PyTorch default** (Windows / Linux CUDA): `torch==2.15.0+cu134` + `torchvision==0.29.2+cu134` via `TORCH_COMMAND` / `TORCH_INDEX_URL` (`https://download.pytorch.org/whl/cu134`). Same pin on first install for both platforms so Linux FA2 builds against the Windows FA2 stack.
 - **Requirements file**: Windows → `requirements_versions_py314_windows.txt`; Linux / macOS → `requirements_versions_py314.txt`.
-- **Flash-Attention 2**: Windows HF prebuilt `flash_attn-2.9.2.post2+cu134torch2.15.0` cp314, wheel variant selected from the GPU compute capability (blackwell / legacy) / Linux PyPI `flash-attn==2.8.4` with `--no-build-isolation` (needs CUDA toolkit 13.4 + `nvcc`) / macOS skip.
+- **Flash-Attention 2**: Windows HF prebuilt `flash_attn-2.9.2.post2+cu134torch2.15.0` cp314, wheel variant selected from the GPU compute capability (blackwell / legacy) / Linux source build of 2.8.4 from the upstream tree with `--no-build-isolation` (needs CUDA toolkit 13.4 + `nvcc`) / macOS skip.
 - **NumPy / SciPy**: all platforms install `numpy==2.5.4` and `scipy==1.16.1` from PyPI (no Windows-only wheel forced onto Linux). NumPy is pinned to 2.5.3 so numba/facexlib work on first install.
 - **ONNX Runtime**: Windows / Linux first launch installs PyPI `onnxruntime-gpu` (InsightFace / ReActor / ADetailer). macOS uses `onnxruntime`.
 - **`clip.py` `pkg_resources` auto-fix**: `venv/Lib/...` on Windows; `venv/lib/pythonX.Y/...` on Linux / macOS (major / minor from the running interpreter).
