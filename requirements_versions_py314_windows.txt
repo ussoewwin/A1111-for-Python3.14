@@ -1,4 +1,4 @@
-setuptools>=77.0.3,<82
+setuptools>=77.0.3
 av
 GitPython==3.1.32
 Pillow==13.0.0
