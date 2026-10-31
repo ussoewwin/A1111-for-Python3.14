@@ -3,7 +3,7 @@ import os
 import torch
 import numpy as np
 from typing import Optional, List, Annotated, ClassVar, Callable, Any, Tuple, Union
-from pydantic import BaseModel, validator, root_validator, Field
+from pydantic import BaseModel, validator, root_validator, Field, ValidationError
 from PIL import Image
 from logging import Logger
 from copy import copy
@@ -468,14 +468,42 @@ class ControlNetUnit(BaseModel):
 
     @classmethod
     def parse(cls, text: str) -> ControlNetUnit:
-        return ControlNetUnit(
-            enabled=True,
-            **{
-                displaytext_to_field(key): parse_value(value)
-                for item in text.split(",")
-                for (key, value) in (item.strip().split(": "),)
-            },
-        )
+        # A1111 quotes an extra generation param when it contains a comma, so the
+        # value may arrive wrapped in quotes; and a single field the unit itself
+        # rejects (for example a ControlNet model that is no longer installed)
+        # must not discard the whole unit. Fields the unit rejects are dropped and
+        # the remaining ones are restored.
+        text = (text or "").strip()
+        if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+            text = text[1:-1]
+
+        fields: dict = {}
+        for item in text.split(","):
+            item = item.strip()
+            if ": " not in item:
+                continue
+            key, value = item.split(": ", 1)
+            field = displaytext_to_field(key.strip())
+            if field in fields:
+                continue
+            fields[field] = parse_value(value)
+
+        fields.pop("enabled", None)
+
+        while True:
+            try:
+                return cls(enabled=True, **fields)
+            except ValidationError as e:
+                rejected = set()
+                for err in e.errors():
+                    loc = err.get("loc") or ()
+                    if isinstance(loc, (list, tuple)) and loc:
+                        rejected.add(loc[0])
+                rejected &= set(fields)
+                if not rejected:
+                    raise
+                for field in rejected:
+                    fields.pop(field, None)
 
     def __copy__(self) -> ControlNetUnit:
         """Override the behavior on `copy.copy` calls."""
