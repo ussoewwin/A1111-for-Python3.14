@@ -92,6 +92,24 @@ class UiSettings:
         if not opts.same_type(value, opts.data_labels[key].default):
             return gr.update(visible=True), opts.dumpjson()
 
+        if key == "sd_model_checkpoint":
+            # Load the checkpoint here instead of relying on the option's onchange
+            # callback: the weight read is an explicit action, so it happens exactly
+            # once, on this path, and it does not depend on the option callback.
+            ckpt_info = sd_models.get_closet_checkpoint_match(value)
+            if ckpt_info is None:
+                return gr.update(value=getattr(opts, key)), opts.dumpjson()
+
+            current = sd_models.get_closet_checkpoint_match(opts.data.get("sd_model_checkpoint", ""))
+            if current == ckpt_info:
+                return gr.update(value=getattr(opts, key)), opts.dumpjson()
+
+            opts.set(key, ckpt_info.title, run_callbacks=False)
+            opts.save(shared.config_filename)
+            sd_models.reload_model_weights()
+
+            return get_value_for_setting(key), opts.dumpjson()
+
         if value is None or not opts.set(key, value):
             return gr.update(value=getattr(opts, key)), opts.dumpjson()
 
