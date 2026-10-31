@@ -773,7 +773,11 @@ def prepare_environment():
             for build_dep in ("packaging", "psutil", "ninja"):
                 if not is_installed(build_dep):
                     run_pip(f"install {build_dep}", build_dep)
-            run_pip(f"install {flash_attn_package} --no-build-isolation", "flash_attn")
+            # Ubuntu/WSL FA2 source build: pin MAX_JOBS=5 for this command only.
+            fa2_env = {**os.environ, "MAX_JOBS": "5"}
+            run(f'"{python}" -m pip install {flash_attn_package} --no-build-isolation',
+                desc="Installing flash_attn", errdesc="Couldn't install flash_attn",
+                custom_env=fa2_env, live=default_command_live)
         else:
             if not flash_attn_package:
                 flash_attn_package = _windows_fa2_wheel()
