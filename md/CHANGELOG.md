@@ -1,6 +1,24 @@
-# Release Notes (v1.01 to v3.0.6)
+# Release Notes (v1.01 to v3.0.7)
 
-This document contains release notes for versions v1.01 through v3.0.6. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.0.7. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+
+---
+
+## v3.0.7
+
+### Updated: PyTorch 2.15.0+cu134 Install Stack, Flash-Attention 2 2.8.4 on Linux, and setuptools 84 Compatibility
+
+- **Updated**: **PyTorch install stack moved to 2.15.0+cu134** - `modules/launch_utils.py` installs `torch==2.15.0+cu134` with `torchvision==0.29.2+cu134` from the cu134 index, and the default index and pip constraint resolve to cu134 as well. Verified in the fork venv: torch `2.15.0+cu134` (CUDA 13.4, `torch.cuda.is_available()` True), torchvision `0.29.2+cu134`.
+- **Changed**: **Linux Flash-Attention 2 is built from the upstream 2.8.4 tree** - the PyPI release `2.8.3.post2` hardcodes `-std=c++17`, while torch 2.15 requires C++20 (`ATen/ATen.h` aborts with `#error C++20 or later compatible compiler is required to use ATen.`), so the Linux source build now installs from the upstream tree at commit `819ef26aae39a1838d0597090880e044230d9261` (`__version__ = 2.8.4`, `cxx_standard = c++20` when torch >= 2.13). `packaging`, `psutil` and `ninja` are installed before the build and `--no-build-isolation` is used, because `setup.py` resolves them through `setup_requires`.
+- **Added**: **Windows Flash-Attention 2 wheel is selected by GPU architecture** - the cu134 + torch 2.15.0 cp314 wheel is chosen from the local GPU compute capability (Blackwell for compute capability major >= 10, legacy otherwise); both wheel URLs verified HTTP 200.
+- **Added**: **The Ubuntu/WSL Flash-Attention 2 source build is pinned to `MAX_JOBS=5`** - the value is passed through a per-command environment (`custom_env`) for the FA2 pip invocation only, so the surrounding process environment is left untouched.
+- **Fixed**: **setuptools 81+ removed `pkg_resources`** - `modules/textual_inversion/autocrop.py` imported `parse_version` from `pkg_resources`, which made the `postprocessing-for-training` extension fail to load with `ModuleNotFoundError: No module named 'pkg_resources'`; it now uses `packaging.version.parse`.
+- **Updated**: **setuptools pinned to `>=84.2.1`** in both `requirements_versions_py314_windows.txt` and `requirements_versions_py314.txt`, matching the installed 84.2.1.
+- **Updated**: **`albumentations` and `pydantic` pins relaxed to minimum versions** - `albumentations==1.4.3` -> `albumentations>=1.4.3` and `pydantic==1.10.25` -> `pydantic>=1.10.25` in the Windows requirements file.
+- **Removed**: **the torchaudio install note** - no code imports torchaudio, so the note was dropped from the install defaults.
+- **Updated**: **the vendored ComfyUI master tree was refreshed to v0.42.1**.
+- **Summary**: The install stack now targets torch 2.15.0 on CUDA 13.4, the Linux Flash-Attention 2 build compiles against torch 2.15 through the upstream 2.8.4 tree instead of the C++17-limited PyPI release, the Ubuntu/WSL build parallelism is fixed at 5, and the setuptools 84 removal of `pkg_resources` no longer breaks extension loading at startup.
+- **Release Note**: [v3.0.7 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.7)
 
 ---
 
