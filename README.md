@@ -301,7 +301,6 @@ This project is built upon the following repositories, each with their respectiv
 - **[ControlAltAI-Nodes](https://github.com/gseth/ControlAltAI-Nodes)** - MIT
 - **[sd-webui-freeu](https://github.com/ShinChaser/sd-webui-freeu)** — MIT
 - **[sd-dynamic-thresholding](https://github.com/mcmonkeyprojects/sd-dynamic-thresholding)** — MIT
-
 See [LICENSE](LICENSE) file for details.
 
 ## Documentation
