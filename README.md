@@ -163,9 +163,9 @@ Pick the section for your OS and follow the steps in order.
 ### Linux
 
 **Toolchain prerequisites**
-- CUDA toolkit 13.4 with `nvcc` on `PATH` (required to build Flash-Attention 2 from source; matches `torch==2.15.0+cu134`).
-- Build toolchain (`gcc`, `g++`, `make`, Python headers).
-- First startup spends ~30 minutes building FA2. To use an alternate prebuilt wheel instead:
+- No compiler or CUDA toolkit is required: Flash-Attention 2 installs from a prebuilt Hugging Face wheel
+  (`2.9.2.post2+cu134torch2.15.0cxx11abitrue` cp314, `blackwell` / `legacy` picked from the GPU compute capability).
+- To use a different wheel instead:
   ```bash
   export FLASH_ATTN_PACKAGE=<url-or-wheel-path>
   ```
