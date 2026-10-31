@@ -1,6 +1,17 @@
-# Release Notes (v1.01 to v3.0.7)
+# Release Notes (v1.01 to v3.0.8)
 
-This document contains release notes for versions v1.01 through v3.0.7. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.0.8. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+
+---
+
+## v3.0.8
+
+### Fixed: Explicit Checkpoint Loading in the Settings UI and Robust ControlNet Infotext Parsing
+
+- **Fixed**: **Checkpoint switching now loads the weights explicitly** - `modules/ui_settings.py` `run_settings_single` wrote the `sd_model_checkpoint` option and relied on its onchange callback (`wrap_queued_call` registered in `modules/initialize_util.py`) to reload the weights, so a switch returned immediately and the load only happened when the callback fired. The checkpoint path now writes the option without firing the callback and calls `sd_models.reload_model_weights()` directly, so the switch returns after the weights have been read, exactly once (`ffa183b5`).
+- **Fixed**: **ControlNet infotext field is interpretable again** - `extensions-builtin/sd-webui-controlnet/internal_controlnet/args.py` `ControlNetUnit.parse` aborted the whole unit when A1111 wrapped the value in quotes (extra generation params containing a comma are written quoted) or when the unit's own validators rejected a single field (a ControlNet module whose preprocessor is not installed, an unknown display text). The parser now strips the surrounding quotes and drops only the fields the unit itself rejects while restoring the remaining ones, so pasting generation parameters no longer discards the whole ControlNet settings and the "legacy format infotext is no longer supported" warning is gone (`e33832f4`).
+- **Summary**: Model switching in the settings UI is now a synchronous, observable load, and pasting generation parameters keeps every ControlNet field the current extension can interpret instead of discarding all of them on the first unparsable token.
+- **Release Note**: [v3.0.8 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.8)
 
 ---
 
