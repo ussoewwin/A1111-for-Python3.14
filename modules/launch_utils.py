@@ -564,6 +564,32 @@ def _windows_fa2_wheel() -> str:
     return template.format(variant)
 
 
+def _linux_fa2_wheel() -> str:
+    """Pick the Flash-Attention 2 Linux wheel that matches the local GPU.
+
+    Same split as the Windows wheels: .blackwell (sm_100 / sm_120 / sm_121) and
+    .legacy (sm_80 / sm_89 / sm_90), cp314, cu134 + torch 2.15.0.
+    """
+    template = (
+        "https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/"
+        "flash_attn-2.9.2.post2%2Bcu134torch2.15.0cxx11abitrue.{}-cp314-cp314-linux_x86_64.whl"
+        "?download=true"
+    )
+    cc_major = _cuda_compute_capability_major()
+    if cc_major is None:
+        print(
+            "[WARNING] Could not detect the GPU compute capability; using the Blackwell "
+            "Flash-Attention 2 wheel. Set FLASH_ATTN_PACKAGE to override."
+        )
+        variant = "blackwell"
+    elif cc_major >= 10:
+        variant = "blackwell"
+    else:
+        variant = "legacy"
+    print(f"[INFO] Flash-Attention 2 wheel variant: {variant}")
+    return template.format(variant)
+
+
 def prepare_environment():
     # Platform defaults (overridable via TORCH_COMMAND / TORCH_INDEX_URL / webui-macos-env.sh):
     #   Windows / Linux CUDA: torch 2.15.0+cu134 + torchvision 0.29.2+cu134 (FA2 cu134 stack)
@@ -612,21 +638,18 @@ def prepare_environment():
     # (evaluation.CLIPFeatureExtractor). WebUI sampling does not import that path;
     # repositories/k-diffusion was patched so package import no longer pulls it in.
     openclip_package = os.environ.get('OPENCLIP_PACKAGE', "https://github.com/mlfoundations/open_clip/archive/bb6e834e9c70d9c27d0dc3ecedeebeaeb1ffad6b.zip")
-    # Flash-Attention 2 source is platform-specific (same torch 2.15.0+cu134 baseline on Win/Linux):
-    #   Windows: prebuilt wheel (cu134 + torch 2.15.0, cp314)
-    #   Linux:   source build from the upstream tree (2.8.4). The newest PyPI release
-    #            (2.8.3.post2) still hardcodes -std=c++17 and cannot build against
-    #            torch 2.15, which requires C++20 (ATen/ATen.h). CUDA toolkit 13.4 + nvcc, ~30min compile
+    # Flash-Attention 2 ships as platform-specific prebuilt wheels (same torch 2.15.0+cu134
+    # baseline on Win/Linux, cp314, variant resolved from the local GPU at install time):
+    #   Windows: flash_attn-2.9.2.post2+cu134torch2.15.0 (blackwell / legacy)
+    #   Linux:   flash_attn-2.9.2.post2+cu134torch2.15.0 (blackwell / legacy)
     #   Mac:     skipped (FA2 requires CUDA; MPS backend cannot use it)
     if platform.system() == "Windows":
         # Resolved at install time from the local GPU architecture (see _windows_fa2_wheel).
         flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE')
         fa2_install_enabled = True
     elif platform.system() == "Linux":
-        flash_attn_package = os.environ.get(
-            'FLASH_ATTN_PACKAGE',
-            'git+https://github.com/Dao-AILab/flash-attention.git@819ef26aae39a1838d0597090880e044230d9261',
-        )
+        # Resolved at install time from the local GPU architecture (see _linux_fa2_wheel).
+        flash_attn_package = os.environ.get('FLASH_ATTN_PACKAGE')
         fa2_install_enabled = True
     else:
         flash_attn_package = None
@@ -767,21 +790,12 @@ def prepare_environment():
         startup_timer.record("install open_clip")
 
     if fa2_install_enabled and not is_installed("flash_attn"):
-        if platform.system() == "Linux":
-            # Source build with --no-build-isolation: setup.py's setup_requires
-            # (packaging, psutil, ninja) must already be in the venv.
-            for build_dep in ("packaging", "psutil", "ninja"):
-                if not is_installed(build_dep):
-                    run_pip(f"install {build_dep}", build_dep)
-            # Ubuntu/WSL FA2 source build: pin MAX_JOBS=5 for this command only.
-            fa2_env = {**os.environ, "MAX_JOBS": "5"}
-            run(f'"{python}" -m pip install {flash_attn_package} --no-build-isolation',
-                desc="Installing flash_attn", errdesc="Couldn't install flash_attn",
-                custom_env=fa2_env, live=default_command_live)
-        else:
-            if not flash_attn_package:
+        if not flash_attn_package:
+            if platform.system() == "Windows":
                 flash_attn_package = _windows_fa2_wheel()
-            run_pip(f"install {flash_attn_package}", "flash_attn")
+            elif platform.system() == "Linux":
+                flash_attn_package = _linux_fa2_wheel()
+        run_pip(f"install {flash_attn_package}", "flash_attn")
         startup_timer.record("install flash_attn")
 
     if not is_installed("ngrok") and args.ngrok:
