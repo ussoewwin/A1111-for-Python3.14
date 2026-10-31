@@ -4,7 +4,7 @@ import os
 import numpy as np
 from PIL import ImageDraw
 from modules import paths_internal
-from pkg_resources import parse_version
+from packaging.version import parse
 
 GREEN = "#0F0"
 BLUE = "#00F"
@@ -299,7 +299,7 @@ def is_square(w, h):
 
 
 model_dir_opencv = os.path.join(paths_internal.models_path, 'opencv')
-if parse_version(cv2.__version__) >= parse_version('4.8'):
+if parse(cv2.__version__) >= parse('4.8'):
     model_file_path = os.path.join(model_dir_opencv, 'face_detection_yunet_2023mar.onnx')
     model_url = 'https://github.com/opencv/opencv_zoo/blob/b6e370b10f641879a87890d44e42173077154a05/models/face_detection_yunet/face_detection_yunet_2023mar.onnx?raw=true'
 else:
