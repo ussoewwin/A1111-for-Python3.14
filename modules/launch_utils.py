@@ -543,10 +543,11 @@ def _windows_fa2_wheel() -> str:
 
     The fork publishes one cp314 wheel per architecture family for this stack:
     .blackwell (sm_100 / sm_120 / sm_121) and .legacy (sm_80 / sm_89 / sm_90).
+    Windows uses 2.8.4; the Linux wheels for this stack are 2.9.2.post2.
     """
     template = (
         "https://huggingface.co/ussoewwin/Flash-Attention-2_for_Windows/resolve/main/"
-        "flash_attn-2.9.2.post2%2Bcu134torch2.15.0cxx11abiTRUE.{}-cp314-cp314-win_amd64.whl"
+        "flash_attn-2.8.4%2Bcu134torch2.15.0cxx11abiTRUE.{}-cp314-cp314-win_amd64.whl"
         "?download=true"
     )
     cc_major = _cuda_compute_capability_major()
@@ -640,7 +641,7 @@ def prepare_environment():
     openclip_package = os.environ.get('OPENCLIP_PACKAGE', "https://github.com/mlfoundations/open_clip/archive/bb6e834e9c70d9c27d0dc3ecedeebeaeb1ffad6b.zip")
     # Flash-Attention 2 ships as platform-specific prebuilt wheels (same torch 2.15.0+cu134
     # baseline on Win/Linux, cp314, variant resolved from the local GPU at install time):
-    #   Windows: flash_attn-2.9.2.post2+cu134torch2.15.0 (blackwell / legacy)
+    #   Windows: flash_attn-2.8.4+cu134torch2.15.0 (blackwell / legacy)
     #   Linux:   flash_attn-2.9.2.post2+cu134torch2.15.0 (blackwell / legacy)
     #   Mac:     skipped (FA2 requires CUDA; MPS backend cannot use it)
     if platform.system() == "Windows":
