@@ -1,6 +1,19 @@
-# Release Notes (v1.01 to v3.0.8)
+# Release Notes (v1.01 to v3.0.9)
 
-This document contains release notes for versions v1.01 through v3.0.8. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.0.9. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+
+---
+
+## v3.0.9
+
+### Added: ConvRot INT8 ControlNet Runtime Support
+
+- **Added**: **ConvRot INT8 ControlNet support** - new `modules/controlnet_int8_convrot.py` installs the runtime INT8 Linear payload of HSWQ ConvRot INT8 ControlNet packs before the float load and strips the `.weight_scale` / `.comfy_quant` sidecar keys, so `load_state_dict` can no longer cast the int8 weights to float.
+- **Fixed**: **int8 ControlNet checkpoints produced NaN** - `extensions-builtin/sd-webui-controlnet/scripts/cldm.py` `PlugableControlModel.__init__` fed the raw int8 tensors to `load_state_dict(strict=False)`, which cast them to float weights and poisoned the sampling output with NaN.
+- **Added**: **the quantized modules keep `torch.nn.Linear` and execute a true W8A8 GEMM** - weights stay int8 in memory; the forward runs `comfy_kitchen` `int8_linear` with the ConvRot rotation applied online, and the instance-level forward shadows the class forward so the LoRA extension's float patch cannot corrupt the int8 payload; LoRA deltas are baked into the int8 weights and requantized.
+- **Added**: **non-installed quantized layers are dequantised instead of loaded raw** - any pack layer whose module does not exist in the ControlNet graph is un-rotated to float before the load rather than left as int8.
+- **Summary**: HSWQ ConvRot INT8 ControlNet packs load and execute without NaN; verified on `control_v11f1e_sd15_tile_hswq_convrot_int8`: 53/53 Linear layers installed, all 13 outputs finite, worst cosine 0.999726 against the fp16 source.
+- **Release Note**: [v3.0.9 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.0.9)
 
 ---
 
