@@ -21,6 +21,22 @@ class PlugableControlModel(nn.Module):
         self.config = config
         self.control_model = ControlNet(**self.config).cpu()
         if state_dict is not None:
+            # ConvRot INT8 ControlNet: install the runtime INT8 Linear payload
+            # before the float load and strip the int8 sidecar keys, so the float
+            # load cannot overwrite the installed int8 weights.
+            try:
+                from modules import controlnet_int8_convrot as _cnint8
+                state_dict, _cn_stats = _cnint8.prepare_controlnet_state_dict(
+                    self.control_model, state_dict)
+                if _cn_stats:
+                    print(
+                        f"[ControlNet ConvRot] Runtime INT8 modules installed: "
+                        f"linear={_cn_stats.get('linear', 0)} "
+                        f"skipped={_cn_stats.get('skipped', 0)} "
+                        f"int8_weight_mb={_cn_stats.get('int8_bytes', 0) / 1e6:.1f}"
+                    )
+            except Exception as _e:
+                print(f"[ControlNet ConvRot] WARNING: runtime INT8 hook failed: {_e}")
             self.control_model.load_state_dict(state_dict, strict=False)
         self.gpu_component = None
         self.is_control_lora = False
