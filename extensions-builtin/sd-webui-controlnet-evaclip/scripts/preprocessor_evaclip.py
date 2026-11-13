@@ -1,3 +1,4 @@
+import gc
 import torch
 import numpy as np
 from typing import NamedTuple
@@ -51,9 +52,34 @@ class PreprocessorEvaCLIP(Preprocessor):
             self.eva_transform_std = eva_transform_std
         return self.model.to(device=self.device)
 
+    def unload(self) -> bool:
+        """Framework entry point used by Preprocessor.unload_unused.
+
+        The base implementation only checks ``self.model.unload_model`` - which the CLIP
+        module does not have - and then parks the CLIP on the CPU, so the 800 MB of
+        weights stayed resident. Release the module instead; ``load_model()`` rebuilds
+        it on demand.
+        """
+        if self.model is None:
+            return False
+        self.unload_model()
+        return True
+
     def unload_model(self):
-        """Unload to meta as CLIP model is large."""
-        self.model.to(device="meta")
+        """Release the model instead of parking it on the meta device.
+
+        ``model.to("meta")`` cannot be undone: torch refuses to copy a parameter
+        out of a meta tensor ("NotImplementedError: Cannot copy out of meta tensor"),
+        so the next ``load_model()`` raised on the first ``to(device)``. Dropping the
+        module releases the weights and ``load_model()`` rebuilds it from the cached
+        checkpoint.
+        """
+        if self.model is None:
+            return
+        self.model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def __call__(
         self,
