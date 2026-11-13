@@ -1,9 +1,22 @@
-# Release Notes (v1.01 to v3.0.9)
+# Release Notes (v1.01 to v3.1.0)
 
-This document contains release notes for versions v1.01 through v3.0.9. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.1.0. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
 
 ---
 
+## v3.1.0
+
+### Added: ConvRot INT8 IP-Adapter (PuLID) Runtime Support, EVA02 CLIP Preprocessor, and EVA02 Unload Fix
+
+- **Added**: **ConvRot INT8 IP-Adapter support** - new `modules/ipadapter_int8_convrot.py` installs the runtime INT8 Linear payload of HSWQ ConvRot INT8 IP-Adapter packs before the float load and strips the `.weight_scale` / `.comfy_quant` sidecar keys, so `IPAdapterModel` no longer hands int8 tensors to `load_state_dict`.
+- **Fixed**: **PuLID ConvRot INT8 packs failed to load** - `extensions-builtin/sd-webui-controlnet/scripts/ipadapter/ipadapter_model.py` `IPAdapterModel.__init__` built `image_proj_model` and `ip_layers` from the raw int8 tensors and raised `RuntimeError: Unexpected key(s) in state_dict: ... weight_scale / comfy_quant`; the int8 payload is now installed on the IP-Adapter graph and `To_KV` is built from the int8 layer shapes, because a fully quantised `ip_adapter` sub graph carries no float weight.
+- **Added**: **the quantized modules keep `torch.nn.Linear` and execute a true W8A8 GEMM** - weights stay int8 in memory, the forward runs `comfy_kitchen` `int8_linear` with the ConvRot rotation applied online, float32 activations are cast to bfloat16 for the kernel and cast back, and other dtypes or CPU use a dequantised weight cached per `(device, dtype)`; a pack without `int8_tensorwise` markers keeps the unchanged float path.
+- **Added**: **the EVA02 CLIP preprocessor PuLID depends on ships with the fork** - `extensions-builtin/sd-webui-controlnet-evaclip` registers `EVA02-CLIP-L-14-336`, which was missing and made `supported_preprocessor.unload_unused` raise `AttributeError: 'NoneType' object has no attribute 'name'` for the `ip-adapter_pulid` unit; `EVA02_CLIP_L_336_psz14_s6B.pt` is placed under the extension HF cache layout, so the preprocessor loads offline.
+- **Fixed**: **the EVA02 preprocessor can be unloaded** - `preprocessor_evaclip.unload_model` parked the CLIP on the meta device, which torch cannot copy out of (`NotImplementedError: Cannot copy out of meta tensor`), and the base `Preprocessor.unload` only moved it to the CPU, so the weights stayed resident; the module is now released and rebuilt on the next load.
+- **Summary**: HSWQ ConvRot INT8 IP-Adapter (PuLID) packs load and run without the sidecar-key error; verified on `ip-adapter_pulid_sdxl_hswq_convrot_int8`: 173/173 Linear layers installed (33 `image_proj` + 140 `ip_adapter`), `cond_emb` / `uncond_emb` finite with cosine 0.999993 / 0.999995 against the fp16 source, the CUDA kernel path matches the dequantised reference at 0.99994-0.99997 for bf16/fp16/fp32 inputs, and the EVA02 preprocessor unload frees 1713.2 MB of VRAM (1725.0 -> 11.8 MB) with a bit-identical result after reload.
+- **Release Note**: [v3.1.0 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.1.0)
+
+---
 ## v3.0.9
 
 ### Added: ConvRot INT8 ControlNet Runtime Support
