@@ -153,7 +153,7 @@ class PreprocessorPuLID(Preprocessor):
         evaclip_preprocessor = Preprocessor.get_preprocessor("EVA02-CLIP-L-14-336")
         assert (
             evaclip_preprocessor is not None
-        ), "EVA02-CLIP-L-14-336 preprocessor not found! Please install sd-webui-controlnet-evaclip"
+        ), "EVA02-CLIP-L-14-336 preprocessor not found! Please install sd-webui-controlnet-evaclip into extensions-builtin"
         r = evaclip_preprocessor(face_features_image)
 
         # Free memory
