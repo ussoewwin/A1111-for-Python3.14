@@ -49,7 +49,7 @@ class ImageEmbed(NamedTuple):
 
 
 class To_KV(torch.nn.Module):
-    def __init__(self, state_dict):
+    def __init__(self, state_dict, int8_layer_shapes=None):
         super().__init__()
 
         self.to_kvs = nn.ModuleDict()
@@ -57,6 +57,15 @@ class To_KV(torch.nn.Module):
             k = key.replace(".weight", "").replace(".", "_")
             self.to_kvs[k] = nn.Linear(value.shape[1], value.shape[0], bias=False)
             self.to_kvs[k].weight.data = value
+
+        # ConvRot INT8 ip_adapter sub graph: every key of that graph is part of the
+        # int8 payload (weight / weight_scale / comfy_quant), so the float loop above
+        # sees none of them and would build an empty To_KV. The shapes are enough to
+        # create the Linears; modules/ipadapter_int8_convrot.py installs the payload.
+        for name, (out_features, in_features) in (int8_layer_shapes or {}).items():
+            self.to_kvs[name.replace(".", "_")] = nn.Linear(
+                in_features, out_features, bias=False
+            )
 
 
 class IPAdapterModel(torch.nn.Module):
@@ -125,8 +134,65 @@ class IPAdapterModel(torch.nn.Module):
                 clip_extra_context_tokens=self.clip_extra_context_tokens,
             )
 
-        self.image_proj_model.load_state_dict(state_dict["image_proj"])
-        self.ip_layers = To_KV(state_dict["ip_adapter"])
+        # ConvRot INT8 IP-Adapter packs (HSWQ) carry a quantised payload in
+        # image_proj / ip_adapter with *.weight_scale and *.comfy_quant sidecar keys,
+        # which a plain float load_state_dict / To_KV cannot consume. Install the
+        # runtime INT8 Linear payload first and strip the sidecar keys. A pack with no
+        # int8_tensorwise marker takes the unchanged float path below.
+        image_proj_state_dict = state_dict["image_proj"]
+        ip_adapter_state_dict = state_dict["ip_adapter"]
+        _ipint8 = None
+        _ip_stats = None
+        try:
+            from modules import ipadapter_int8_convrot as _ipint8  # noqa: F401
+        except Exception as _e:  # noqa: BLE001
+            print(f"[IPAdapter ConvRot] WARNING: runtime INT8 hook unavailable: {_e}")
+
+        if _ipint8 is not None:
+            image_proj_state_dict, _ip_stats = _ipint8.prepare_state_dict(
+                self.image_proj_model, image_proj_state_dict
+            )
+            if _ip_stats:
+                print(
+                    f"[IPAdapter ConvRot] image_proj runtime INT8 modules installed: "
+                    f"linear={_ip_stats.get('linear', 0)} "
+                    f"skipped={_ip_stats.get('skipped', 0)} "
+                    f"int8_weight_mb={_ip_stats.get('int8_bytes', 0) / 1e6:.1f}"
+                )
+
+        if _ip_stats:
+            _ipint8.load_prepared(
+                self.image_proj_model, image_proj_state_dict, _ip_stats
+            )
+        else:
+            self.image_proj_model.load_state_dict(image_proj_state_dict)
+
+        _ip_layers = None
+        if _ipint8 is not None:
+            ip_adapter_state_dict, _ip_layers = _ipint8.split_convrot_int8(
+                ip_adapter_state_dict
+            )
+        self.ip_layers = To_KV(
+            ip_adapter_state_dict,
+            int8_layer_shapes=(
+                _ipint8.layer_shapes(_ip_layers) if _ip_layers else None
+            ),
+        )
+        if _ip_layers:
+            _ip_stats, _ip_installed = _ipint8.install_runtime_int8(
+                self.ip_layers, _ip_layers
+            )
+            print(
+                f"[IPAdapter ConvRot] ip_adapter runtime INT8 modules installed: "
+                f"linear={_ip_stats.get('linear', 0)} "
+                f"skipped={_ip_stats.get('skipped', 0)} "
+                f"int8_weight_mb={_ip_stats.get('int8_bytes', 0) / 1e6:.1f}"
+            )
+            if _ip_stats.get("skipped"):
+                raise RuntimeError(
+                    f"{_ip_stats['skipped']} ConvRot INT8 ip_adapter layer(s) have no "
+                    f"module in the built graph"
+                )
 
     def init_proj_faceid(self):
         if self.is_plus:
