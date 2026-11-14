@@ -1,9 +1,19 @@
-# Release Notes (v1.01 to v3.1.0)
+# Release Notes (v1.01 to v3.1.1)
 
-This document contains release notes for versions v1.01 through v3.1.0. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
+This document contains release notes for versions v1.01 through v3.1.1. Through v2.3.5 the published surface was `ussoewwin/A1111-for-Python3.12`; from **v3.0.0** the fork continues as `ussoewwin/A1111-for-Python3.14`.
 
 ---
 
+## v3.1.1
+
+### Changed: ControlNet Model List Refresh on UI Build and New SD1.5 IP-Adapter Plus Preprocessor Entry
+
+- **Changed**: **ControlNet model directories are rescanned when the UI is built** - `extensions-builtin/sd-webui-controlnet/scripts/controlnet.py` `Script.ui` now calls `global_state.update_cn_models()` before creating the gradio elements, so a pack copied into the ControlNet model directory while the server is already running appears in the Model dropdown after a UI reload without a restart; the refresh button next to the dropdown keeps working for the running session. Rescan cost measured at 0.04s for 51 files (model hash cache).
+- **Added**: **an `ip-adapter_clip_sd15_plus` Preprocessor entry** - the SD1.5 IP-Adapter encoders were only exposed as `ip-adapter_clip_sd15` with the label `ip-adapter_clip_h`, so the SD1.5 plus models had no matching entry in the Preprocessor dropdown; the same CLIP ViT-H/14 encoder is registered under an explicit `ip-adapter_clip_sd15_plus` name (`extensions-builtin/sd-webui-controlnet/scripts/preprocessor/ip_adapter_sd15_plus.py`), with the encode and its cache remaining the legacy `clip` / `unload_clip` pair at `config='clip_h'`, and the legacy entry unchanged. The ConvRot INT8 SD1.5 plus pack `ip-adapter_sd15_plus_hswq_convrot_int8` loads 54/54 Linear layers (22 `image_proj` + 32 `ip_adapter`) and produces `cond` / `uncond` of shape (1, 16, 768) with finite values.
+- **Summary**: a pack added to the ControlNet model directory becomes selectable after a UI reload without restarting the server, and SD1.5 IP-Adapter Plus models now have a matching Preprocessor entry.
+- **Release Note**: [v3.1.1 Release](https://github.com/ussoewwin/A1111-for-Python3.14/releases/tag/v3.1.1)
+
+---
 ## v3.1.0
 
 ### Added: ConvRot INT8 IP-Adapter (PuLID) Runtime Support, EVA02 CLIP Preprocessor, and EVA02 Unload Fix
