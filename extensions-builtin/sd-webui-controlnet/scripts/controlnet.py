@@ -372,6 +372,12 @@ class Script(scripts.Script, metaclass=(
         """
         self.is_img2img = is_img2img
 
+        # Rescan the model directories whenever the UI is (re)built, so a pack that
+        # was added while the server was already running shows up after a UI reload
+        # without a restart. The refresh button next to the Model dropdown does the
+        # same for the running session (0.04s for 51 files with the model-hash cache).
+        global_state.update_cn_models()
+
         infotext = Infotext()
         ui_groups = []
         controls = []
